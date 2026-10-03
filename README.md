@@ -7,7 +7,7 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.0.1-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.0.1)
+[![Version](https://img.shields.io/badge/version-1.0.2-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.0.2)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
 [![Verification](https://img.shields.io/badge/verified-224%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
@@ -137,12 +137,12 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.0.1 archive |
+| Platform | v1.0.2 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.0.1-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.0.1-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.0.1-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.0.1-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.0.2-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.0.2-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.0.2-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.0.2-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
 
