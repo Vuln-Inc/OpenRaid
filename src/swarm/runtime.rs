@@ -540,6 +540,11 @@ impl Harness {
         self.store.mark_worker_finished(&id).await?;
         self.control
             .publish_membership(self.store.membership().await?);
+        if *self.shutdown.borrow() || self.control.is_closing() {
+            self.metrics.set_status(&id, AgentStatus::Finished);
+            self.control.finish_draining(&id);
+            return Ok(false);
+        }
         if !self.control.members().contains(&id) {
             self.metrics.set_status(&id, AgentStatus::Finished);
             self.control.finish_draining(&id);
@@ -971,15 +976,20 @@ async fn wait_while_paused(
     shutdown: &mut WorkerStop,
 ) -> Result<bool> {
     let mut paused = shared.control.pause_receiver();
-    while *paused.borrow() && !shutdown.requested() {
+    let mut closing = shared.control.stop_receiver();
+    while *paused.borrow() && !shutdown.requested() && !*closing.borrow() {
         shared.metrics.set_status(id, AgentStatus::Waiting);
         shared.metrics.set_detail(id, "paused · resume to continue");
         tokio::select! {
             changed = paused.changed() => { changed.context("pause control disconnected")?; },
             changed = shutdown.changed() => { changed?; },
+            changed = closing.changed() => { changed.context("session close control disconnected")?; },
         }
     }
-    Ok(!shutdown.requested())
+    // Close is published before the supervisor commits durable drain. Observe
+    // it at admission directly, rather than letting a fast completed response
+    // dispatch another provider turn in that intervening scheduler window.
+    Ok(!shutdown.requested() && !*closing.borrow())
 }
 
 async fn drain_board(

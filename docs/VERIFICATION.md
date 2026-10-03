@@ -39,6 +39,14 @@ startup from clearing an already-acknowledged stop between selecting a prompt an
 admitting its workers. The snapshot/control regression verifies that late admission
 preserves the stop signal.
 
+The native release gate additionally exposed a close/admission race on Linux:
+workers now observe console closure directly at dispatch boundaries, and the
+supervisor does not restart a worker finishing during closure. The held-request
+detach regression explicitly rejects any subsequent provider turn.
+The corrected ten-test session-control suite and warnings-denied all-target Clippy
+passed again on Windows and Linux; the Linux held-request detach regression then
+passed **80 consecutive runs**.
+
 The held-MCP initialization regression now waits for its explicit request-start
 barrier before allowing a fast offline round to reach consensus; it retains the
 worker-collaboration and final transport-shutdown assertions.

@@ -516,9 +516,17 @@ async fn detach_drains_active_request_and_preserves_unfinished_task_for_resume()
     request(&mut socket).await?;
     control.detach();
     response(&mut socket, "board_post", json!({"body":"unstarted post"})).await?;
-    let summary = tokio::time::timeout(Duration::from_secs(5), run).await???;
+    let summary = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .context("closed session did not drain its admitted request")???;
     assert_eq!(summary.votes, 0);
     assert_eq!(summary.finished_agents, 1);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "closed session must not dispatch another provider turn"
+    );
     assert_eq!(
         store.unfinished_prompt().await?.unwrap().body,
         "unfinished task survives explicit close"
