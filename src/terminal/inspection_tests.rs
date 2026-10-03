@@ -2,18 +2,37 @@ use super::*;
 use ratatui::backend::TestBackend;
 
 fn render(app: &mut UiState, metrics: &Metrics, width: u16, height: u16) -> String {
+    buffer_text(&render_buffer(app, metrics, width, height), width)
+}
+
+fn render_buffer(
+    app: &mut UiState,
+    metrics: &Metrics,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| draw(frame, app, &metrics.snapshot(), metrics))
         .unwrap();
-    terminal
-        .backend()
-        .buffer()
+    terminal.backend().buffer().clone()
+}
+
+fn buffer_text(buffer: &ratatui::buffer::Buffer, width: u16) -> String {
+    buffer
         .content()
         .chunks(usize::from(width))
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn text_cell<'a>(buffer: &'a ratatui::buffer::Buffer, text: &str) -> &'a ratatui::buffer::Cell {
+    &buffer
+        .content()
+        .windows(text.len())
+        .find(|cells| cells.iter().map(|cell| cell.symbol()).collect::<String>() == text)
+        .unwrap_or_else(|| panic!("missing rendered text: {text}"))[0]
 }
 
 async fn press(app: &mut UiState, store: &Store, code: KeyCode, agents: usize) -> bool {
@@ -279,4 +298,150 @@ async fn inspector_palette_action_opens_from_board_and_keeps_composer_draft() ->
         assert!(app.focus == Focus::Board);
     }
     Ok(())
+}
+
+#[test]
+fn inspector_distinguishes_response_tool_and_result_with_readable_theme_styles() {
+    let metrics = Metrics::new(1);
+    metrics.append_output("agent-001", "RESPONSE_PAYLOAD\n");
+    metrics.record_tool_start("agent-001", "read_file", "ARGUMENT_PAYLOAD");
+    metrics.record_tool_result("agent-001", "read_file", "RESULT_PAYLOAD");
+    let mut app = UiState::default();
+    app.open_inspection(1);
+    app.inspection_follow = false;
+    let buffer = render_buffer(&mut app, &metrics, 120, 32);
+    let palette = crate::theme::current_palette();
+
+    for label in ["Response", "Tool run", "Tool result"] {
+        let cell = text_cell(&buffer, label);
+        assert!(cell.modifier.contains(Modifier::BOLD), "{label}");
+        assert_ne!(cell.fg, palette.muted, "{label}");
+    }
+    for payload in ["RESPONSE_PAYLOAD", "ARGUMENT_PAYLOAD", "RESULT_PAYLOAD"] {
+        let cell = text_cell(&buffer, payload);
+        assert_eq!(cell.fg, palette.text, "{payload}");
+        assert!(!cell.modifier.contains(Modifier::BOLD), "{payload}");
+    }
+    assert_eq!(text_cell(&buffer, "ARGUMENT_PAYLOAD").bg, palette.surface);
+    assert_eq!(text_cell(&buffer, "RESULT_PAYLOAD").bg, palette.surface);
+    assert_eq!(
+        text_cell(&buffer, "RESPONSE_PAYLOAD").bg,
+        palette.background
+    );
+    let output = buffer_text(&buffer, 120);
+    assert!(output.contains("read_file"));
+    assert!(output.contains("Following") || output.contains("History"));
+    assert!(output.contains("Esc"));
+}
+
+#[test]
+fn inspector_keeps_code_fenced_header_like_payload_as_content() {
+    let metrics = Metrics::new(1);
+    metrics.record_tool_start("agent-001", "read_file", "SOURCE_ARGUMENTS");
+    metrics.record_tool_result(
+        "agent-001",
+        "read_file",
+        "```text\n\n[tool] literal_marker\n\n[result] literal_result\n```\nRESULT_END",
+    );
+    let mut app = UiState::default();
+    app.open_inspection(1);
+    app.inspection_follow = false;
+    let buffer = render_buffer(&mut app, &metrics, 120, 32);
+    let output = buffer_text(&buffer, 120);
+    for payload in [
+        "SOURCE_ARGUMENTS",
+        "literal_marker",
+        "literal_result",
+        "RESULT_END",
+    ] {
+        assert!(output.contains(payload), "{payload}");
+        assert_eq!(
+            text_cell(&buffer, payload).fg,
+            crate::theme::current_palette().text
+        );
+        assert!(!text_cell(&buffer, payload)
+            .modifier
+            .contains(Modifier::BOLD));
+    }
+    assert_eq!(output.matches("Tool run").count(), 1);
+    assert_eq!(output.matches("Tool result").count(), 1);
+}
+
+#[test]
+fn inspector_responsive_layout_keeps_transcript_and_history_state_readable() {
+    let metrics = Metrics::new(1);
+    metrics.record_usage("agent-001", 1234, 567, 89);
+    metrics.append_output("agent-001", "RESPONSIVE_TRANSCRIPT\n");
+    let mut app = UiState::default();
+    app.open_inspection(1);
+    app.inspection_follow = false;
+    for (width, height) in [(60, 18), (99, 24), (100, 16), (120, 32)] {
+        let output = render(&mut app, &metrics, width, height);
+        assert!(
+            output.contains("RESPONSIVE_TRANSCRIPT"),
+            "{width}x{height}\n{output}"
+        );
+        assert!(output.contains("agent-001"), "{width}x{height}");
+        assert!(output.contains("History"), "{width}x{height}\n{output}");
+        assert!(output.contains("Esc"), "{width}x{height}");
+        assert!(!app.inspection_follow);
+        assert_eq!(app.inspection_scroll, 0);
+        if width >= 100 && height >= 16 {
+            for section in ["Session", "Usage", "Activity", "Tools", "Retries"] {
+                assert!(
+                    output.contains(section),
+                    "{section}: {width}x{height}\n{output}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn inspector_formats_real_activity_markers_after_unterminated_streams() {
+    let metrics = Metrics::new(1);
+    metrics.append_output("agent-001", "UNTERMINATED_RESPONSE");
+    metrics.set_detail("agent-001", "STATUS_PAYLOAD");
+    metrics.append_output("agent-001", "SECOND_UNTERMINATED_RESPONSE");
+    metrics.record_tool_start("agent-001", "run_command", "TOOL_ARGUMENTS");
+    metrics.append_activity("agent-001", "UNTERMINATED_PROCESS_OUTPUT");
+    metrics.record_tool_result("agent-001", "run_command", "TOOL_COMPLETED");
+    metrics.append_output("agent-001", "POST_TOOL_GENERATION_");
+    metrics.append_output("agent-001", "COMPLETED");
+    let mut app = UiState::default();
+    app.open_inspection(1);
+    app.inspection_follow = false;
+    let buffer = render_buffer(&mut app, &metrics, 120, 40);
+    let output = buffer_text(&buffer, 120);
+
+    for label in ["Response", "Status", "Tool run", "Tool result"] {
+        assert!(output.contains(label), "{label}\n{output}");
+    }
+    for raw_marker in ["[status]", "[tool]", "[result]", "[response]"] {
+        assert!(!output.contains(raw_marker), "{raw_marker}\n{output}");
+    }
+    for payload in [
+        "UNTERMINATED_RESPONSE",
+        "STATUS_PAYLOAD",
+        "SECOND_UNTERMINATED_RESPONSE",
+        "TOOL_ARGUMENTS",
+        "UNTERMINATED_PROCESS_OUTPUT",
+        "TOOL_COMPLETED",
+        "POST_TOOL_GENERATION_COMPLETED",
+    ] {
+        assert!(output.contains(payload), "{payload}\n{output}");
+    }
+    assert_eq!(
+        text_cell(&buffer, "Tool run").fg,
+        crate::theme::current_palette().accent
+    );
+    assert_eq!(
+        text_cell(&buffer, "Tool result").fg,
+        crate::theme::current_palette().success
+    );
+    assert_eq!(output.matches("Response").count(), 3, "{output}");
+    let resumed = text_cell(&buffer, "POST_TOOL_GENERATION_COMPLETED");
+    assert_eq!(resumed.fg, crate::theme::current_palette().text);
+    assert_eq!(resumed.bg, crate::theme::current_palette().background);
+    assert!(!resumed.modifier.contains(Modifier::BOLD));
 }

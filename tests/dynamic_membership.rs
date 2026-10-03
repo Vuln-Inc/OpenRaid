@@ -363,6 +363,7 @@ async fn removed_worker_drains_http_and_checkpoint_while_added_worker_reads_full
         .await?;
         let control = harness.control.clone();
         let store = harness.store.clone();
+        let metrics = harness.metrics.clone();
         let run = tokio::spawn(harness.run());
         let mut initial = vec![
             events.recv().await.context("first request absent")?,
@@ -386,6 +387,22 @@ async fn removed_worker_drains_http_and_checkpoint_while_added_worker_reads_full
         assert_eq!(added?, vec!["agent-003"]);
         assert!(!control.members().contains(&"agent-001".into()));
         assert!(
+            metrics
+                .snapshot_for_members(&control.members())
+                .agents
+                .iter()
+                .all(|agent| agent.id != "agent-001"),
+            "the committed roster hides a removed agent before its HTTP response finishes"
+        );
+        assert!(
+            metrics
+                .snapshot()
+                .agents
+                .iter()
+                .any(|agent| agent.id == "agent-001"),
+            "retirement must retain historical metrics while the worker drains"
+        );
+        assert!(
             !run.is_finished(),
             "removal cannot finish a blocked provider request"
         );
@@ -399,6 +416,16 @@ async fn removed_worker_drains_http_and_checkpoint_while_added_worker_reads_full
         );
         let late = events.recv().await.context("late worker request absent")?;
         assert_eq!(late.id, "agent-003");
+        assert_eq!(
+            metrics
+                .snapshot_for_members(&control.members())
+                .agents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent-002", "agent-003"],
+            "the active dashboard shows the late joiner without reviving retired rows"
+        );
         let wire = late.body["messages"].to_string();
         assert!(wire.contains("global history sentinel before late join"));
         assert!(wire.contains("verify changing membership without cancelling provider work"));

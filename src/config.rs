@@ -11,6 +11,35 @@ pub fn default_database_path(workspace: &Path) -> PathBuf {
     workspace.join(".openraid").join("openraid.sqlite3")
 }
 
+/// Older saved launches and catalog entries used the workspace-root default.
+/// Only implicit reopening uses this correction; explicit database/session
+/// selection can still open that history, and custom paths stay unchanged.
+pub fn remembered_database_path(workspace: &Path, database: &Path) -> PathBuf {
+    let resolved = if database.is_absolute() {
+        database.to_owned()
+    } else {
+        workspace.join(database)
+    };
+    let legacy_default = resolved == workspace.join("openraid.sqlite3")
+        || (resolved
+            .file_name()
+            .is_some_and(|name| name == "openraid.sqlite3")
+            && resolved.parent().is_some_and(|parent| {
+                match (
+                    std::fs::canonicalize(parent),
+                    std::fs::canonicalize(workspace),
+                ) {
+                    (Ok(parent), Ok(workspace)) => parent == workspace,
+                    _ => false,
+                }
+            }));
+    if legacy_default {
+        default_database_path(workspace)
+    } else {
+        database.to_owned()
+    }
+}
+
 /// Shared settings for the single-process swarm. The grace period applies only
 /// to completion consensus, never to an operation or provider request.
 #[derive(Clone)]
@@ -119,7 +148,46 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::default_database_path;
+    use super::{default_database_path, remembered_database_path};
+
+    #[test]
+    fn remembered_root_default_is_corrected_even_after_database_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        let expected = default_database_path(workspace);
+        for database in [
+            workspace.join("openraid.sqlite3"),
+            std::path::PathBuf::from("openraid.sqlite3"),
+            std::path::PathBuf::from("./openraid.sqlite3"),
+            workspace.join("./openraid.sqlite3"),
+        ] {
+            assert_eq!(remembered_database_path(workspace, &database), expected);
+        }
+        std::fs::write(workspace.join("openraid.sqlite3"), "old history").unwrap();
+        assert_eq!(
+            remembered_database_path(workspace, &workspace.join("openraid.sqlite3")),
+            expected
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("openraid.sqlite3")).unwrap(),
+            "old history"
+        );
+        assert!(!expected.exists());
+    }
+
+    #[test]
+    fn remembered_custom_database_locations_are_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        for database in [
+            default_database_path(workspace),
+            workspace.join("custom.sqlite3"),
+            workspace.join("history/openraid.sqlite3"),
+            std::path::PathBuf::from("custom.sqlite3"),
+        ] {
+            assert_eq!(remembered_database_path(workspace, &database), database);
+        }
+    }
 
     #[test]
     fn default_store_is_nested_even_when_root_store_exists() {

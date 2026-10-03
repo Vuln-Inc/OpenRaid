@@ -245,7 +245,11 @@ impl RunArgs {
                     .as_ref()
                     .map(|entry| entry.database.clone())
             })
-            .or_else(|| latest.map(|entry| entry.database))
+            .or_else(|| {
+                latest.map(|entry| {
+                    openraid::config::remembered_database_path(&workspace, &entry.database)
+                })
+            })
             .unwrap_or_else(|| {
                 if self.new_session {
                     return workspace
@@ -256,7 +260,9 @@ impl RunArgs {
                 profile
                     .as_ref()
                     .filter(|profile| profile.workspace == workspace)
-                    .map(|profile| profile.database.clone())
+                    .map(|profile| {
+                        openraid::config::remembered_database_path(&workspace, &profile.database)
+                    })
                     .unwrap_or_else(|| default_database_path(&workspace))
             });
         let database = if database.is_absolute() {
@@ -472,6 +478,9 @@ impl RunArgs {
 
 async fn enable_remembered_recovery(config: &mut Config, remembered_home: bool) -> Result<()> {
     if remembered_home
+        // Opening the console is not permission to restart unfinished work.
+        // Explicit --resume is already reflected in config.resume.
+        && !config.interactive_session
         && !config.resume
         && config.objective.trim().is_empty()
         && config.database.is_file()
@@ -1805,6 +1814,29 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn remembered_tui_requires_explicit_resume_for_unfinished_work() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("remembered.sqlite3");
+        let store = Store::open(&database).await?;
+        let prompt = store.append("owner", "unfinished task", true).await?;
+        let mut config = Config {
+            database,
+            interactive_session: true,
+            ..Config::default()
+        };
+
+        enable_remembered_recovery(&mut config, true).await?;
+        assert!(!config.resume, "opening the TUI must not resume work");
+        assert_eq!(store.unfinished_prompt().await?, Some(prompt.clone()));
+
+        config.resume = true;
+        enable_remembered_recovery(&mut config, true).await?;
+        assert!(config.resume, "explicit --resume must remain honored");
+        assert_eq!(store.unfinished_prompt().await?, Some(prompt));
+        Ok(())
     }
 
     #[test]

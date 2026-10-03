@@ -98,8 +98,12 @@ impl Harness {
         ensure!(system_window.estimated_tokens().saturating_add(256) < available,
             "immutable system prompt/objective exceeds available model context; increase --context-budget or shorten the objective");
         let store = Store::open(&config.database).await?;
+        // An idle console still opens the existing session's durable roster.
+        // Retaining that state must not imply starting its unfinished task.
+        let retain_membership =
+            config.resume || (config.interactive_session && config.objective.trim().is_empty());
         let membership = store
-            .initialize_membership(config.agents, config.resume)
+            .initialize_membership(config.agents, retain_membership)
             .await?;
         let initial_board_seq = store.latest_seq().await?;
         let metrics = Arc::new(Metrics::new(0));
@@ -1320,6 +1324,49 @@ mod tests {
         assert!(!gate.update(3, 2, now + Duration::from_secs(5)));
         assert!(!gate.update(4, 2, now + Duration::from_secs(6)));
         assert!(gate.update(4, 2, now + Duration::from_secs(8)));
+    }
+
+    #[tokio::test]
+    async fn idle_reopen_preserves_durable_roster_votes_and_checkpoints() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let database = directory.path().join("idle-reopen.sqlite3");
+        let store = Store::open(&database).await?;
+        let membership = store.initialize_membership(2, false).await?;
+        let prompt = store.append("owner", "unfinished task", true).await?;
+        store
+            .set_vote(&membership.agent_ids[0], true, "completed my part")
+            .await?;
+        let vote = store.vote(&membership.agent_ids[0]).await?;
+        let checkpoint = json!({"cursor":prompt.seq,"messages":[]});
+        store
+            .save_checkpoint(&membership.agent_ids[0], &checkpoint)
+            .await?;
+        let cursor = store.latest_seq().await?;
+
+        let harness = Harness::new(Config {
+            agents: 1,
+            workspace: directory.path().to_owned(),
+            database,
+            mock: true,
+            interactive_session: true,
+            ..Config::default()
+        })
+        .await?;
+
+        assert_eq!(harness.control.members(), membership.agent_ids);
+        assert_eq!(store.membership().await?, membership);
+        assert_eq!(store.vote("agent-001").await?, vote);
+        assert_eq!(store.load_checkpoint("agent-001").await?, Some(checkpoint));
+        assert_eq!(store.unfinished_prompt().await?, Some(prompt));
+        assert_eq!(store.latest_seq().await?, cursor);
+        assert!(!harness.control.is_busy());
+        assert!(harness
+            .metrics
+            .snapshot()
+            .agents
+            .iter()
+            .all(|agent| agent.status == AgentStatus::Waiting));
+        Ok(())
     }
 
     #[tokio::test]

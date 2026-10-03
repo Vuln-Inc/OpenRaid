@@ -1,7 +1,14 @@
 use anyhow::{ensure, Context, Result};
 use openraid::{auth::AuthStore, config::Config, storage::Store, workspace::WorkspaceTools};
 use serde_json::{json, Value};
-use std::{path::Path, time::Duration};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -87,8 +94,26 @@ async fn exit_console(workspace: &WorkspaceTools, id: &str) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_console(workspace: &WorkspaceTools, id: &str) -> Result<()> {
+    loop {
+        let page = workspace.execute("pty_read", &json!({"id":id})).await?;
+        if page["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("openraid by vuln.industries")
+        {
+            return Ok(());
+        }
+        ensure!(
+            page["output_complete"] != true,
+            "remembered home exited: {page}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn actual_setup_automatically_recovers_remembered_task_then_keeps_completed_home_idle(
+async fn actual_setup_keeps_unfinished_home_idle_until_explicit_resume_then_completed_home_idle(
 ) -> Result<()> {
     // This timeout belongs solely to the regression harness, never to a model,
     // native operation, or production recovery policy.
@@ -116,10 +141,13 @@ async fn actual_setup_automatically_recovers_remembered_task_then_keeps_complete
             ..Config::default()
         });
         auth.save()?;
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let server_request_count = request_count.clone();
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             for index in 0..2 {
                 let (mut socket, _) = listener.accept().await?;
+                server_request_count.fetch_add(1, Ordering::SeqCst);
                 requests.push(read_request(&mut socket).await?);
                 let body = json!({"choices":[{"message":{"role":"assistant","tool_calls":[{
                     "id":format!("recovered-vote-{index}"),"type":"function","function":{
@@ -133,7 +161,25 @@ async fn actual_setup_automatically_recovers_remembered_task_then_keeps_complete
         });
         let workspace = WorkspaceTools::new(&root, 2)?;
         let command = setup_command(&root, &auth_path);
-        let child = workspace.execute("pty_spawn", &json!({"command":command,"rows":30,"cols":120})).await?;
+        let unfinished_cursor = store.latest_seq().await?;
+        let checkpoint = store.load_checkpoint(&roster.agent_ids[0]).await?;
+        let idle = workspace.execute("pty_spawn", &json!({"command":command,"rows":30,"cols":120})).await?;
+        let idle_id = idle["id"].as_str().context("idle console id missing")?;
+        wait_for_console(&workspace, idle_id).await?;
+        // Give startup and the runtime's board-refresh loop time to act, so a
+        // rendered console alone cannot mask an automatically resumed round.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(request_count.load(Ordering::SeqCst), 0, "reopening must not send provider requests");
+        assert_eq!(store.latest_seq().await?, unfinished_cursor, "reopening must not start a round or append board messages");
+        assert_eq!(store.membership().await?.agent_ids, roster.agent_ids, "idle reopening preserves the durable roster");
+        assert_eq!(store.load_checkpoint(&roster.agent_ids[0]).await?, checkpoint);
+        assert_eq!(store.unfinished_prompt().await?, Some(prompt.clone()));
+        exit_console(&workspace, idle_id).await?;
+        assert_eq!(store.latest_seq().await?, unfinished_cursor, "exiting the idle console must not drain unfinished work");
+        assert_eq!(store.unfinished_prompt().await?, Some(prompt));
+
+        let resume_command = format!("{command} --resume");
+        let child = workspace.execute("pty_spawn", &json!({"command":resume_command,"rows":30,"cols":120})).await?;
         let id = child["id"].as_str().context("native console id missing")?;
         loop {
             if store.read_board(0, 100).await?.iter().any(|entry| entry.body == "all workers drained; swarm complete") {
@@ -147,21 +193,14 @@ async fn actual_setup_automatically_recovers_remembered_task_then_keeps_complete
         assert!(requests.iter().all(|request| request["messages"].to_string().contains("remembered unfinished task sentinel")));
         assert!(requests.iter().any(|request| request["messages"].to_string().contains("remembered checkpoint history sentinel")));
         assert_eq!(store.membership().await?.agent_ids, roster.agent_ids);
-        assert_eq!(store.prompts().await?.len(), 1, "automatic recovery does not repost the task");
+        assert_eq!(store.prompts().await?.len(), 1, "explicit recovery does not repost the task");
         exit_console(&workspace, id).await?;
         assert!(store.unfinished_prompt().await?.is_none());
         let completed_cursor = store.latest_seq().await?;
 
         let idle = workspace.execute("pty_spawn", &json!({"command":command,"rows":30,"cols":120})).await?;
         let idle_id = idle["id"].as_str().context("idle console id missing")?;
-        loop {
-            let page = workspace.execute("pty_read", &json!({"id":idle_id})).await?;
-            if page["content"].as_str().unwrap_or_default().contains("openraid by vuln.industries") {
-                break;
-            }
-            ensure!(page["output_complete"] != true, "remembered home exited: {page}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_console(&workspace, idle_id).await?;
         exit_console(&workspace, idle_id).await?;
         assert_eq!(store.latest_seq().await?, completed_cursor, "completed history is audit-only at the remembered home");
         assert_eq!(store.prompts().await?.len(), 1);

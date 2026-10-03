@@ -1,5 +1,78 @@
 # Verification record
 
+## v1.1.1 — Session reopening, storage, roster, and inspection
+
+This patch release combines the issue #15 fix and the #16–#18 fixes documented
+below. The combined Windows acceptance passed **316 Rust tests**: 187 library,
+19 CLI-configuration, and 110 integration tests, with no failures or ignored
+tests. Release preparation reran the full locked all-target suite with version
+**1.1.1** and passed the same 316 tests. Warnings-denied all-target Clippy,
+formatting, and whitespace checks passed. The Node SDK/provider/transport suite
+was also rerun and passed **25 tests**. README links/headings, SVG validity, and
+the publication-source scan passed.
+
+Release automation verifies and builds Linux x86-64, Windows x86-64, macOS Intel,
+and macOS Apple Silicon. Publication and downloadable archives depend on those
+native CI jobs succeeding; the local acceptance results do not assert CI success.
+
+## Remembered databases, live roster, and agent inspection — issues #16–#18
+
+- **#16:** Implicit workspace reopening corrects the old root
+  `openraid.sqlite3` path from both remembered launch profiles and the latest
+  session catalog entry to `.openraid/openraid.sqlite3`. The corrected launch
+  profile is saved on startup. Existing root database/WAL/SHM files remain
+  untouched; explicit `--database`/`--session` and custom paths retain their
+  behavior. `tests/workspace_database_migration.rs` exercises actual native
+  terminal launches, including a second reopening and explicit old-session access.
+- **#17:** The dashboard renders the committed active roster independently of
+  historical telemetry and retiring workers. Removed agents disappear on the
+  next redraw while admitted work drains safely. Selection follows agent identity
+  across earlier-row removal; retiring the inspected agent resets its history
+  cursor. Rendered-sidebar tests and a held-HTTP membership regression verify
+  immediate visibility, retained usage/activity, and completed retirement.
+- **#18:** Individual inspection uses OpenCode's
+  [session view](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/routes/session/index.tsx)
+  and [sidebar](https://github.com/anomalyco/opencode/blob/dev/packages/tui/src/routes/session/sidebar.tsx)
+  as references: an accented transcript, distinct response/tool/result headings,
+  themed payload surfaces, and a responsive session/usage/activity sidebar.
+  Compact terminals retain the transcript and follow/history controls. Rendering
+  regressions cover visual hierarchy, literal fenced payloads, resizing, Unicode,
+  complete history beyond 65,535 rows, and existing inspection navigation.
+
+Final Windows verification passed on **2026-10-04**:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --locked --all-targets -- --include-ignored` | **316 passed, 0 failed, 0 ignored**: 187 library, 19 CLI-configuration, 110 integration, including native terminal and optional Node/MCP/SDK fixtures |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `git diff --check` | Passed |
+
+## Idle session reopening — issue #15
+
+Interactive `setup` and session switching now open saved sessions idle, including
+unfinished tasks. Work begins when the operator submits an objective, or when
+the launch explicitly requests `--resume`. Idle reopening preserves the durable
+roster, votes, checkpoints, and unfinished prompt.
+
+The native terminal regression in `tests/remembered_recovery.rs` verifies zero
+provider requests and zero new board rows while reopening and exiting unfinished
+history, then verifies explicit `setup --resume` restores the original task,
+roster, and checkpoint without duplicating the prompt. Focused startup and runtime
+unit tests cover the recovery opt-in and durable-state preservation.
+
+Windows verification passed on **2026-10-04**:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --locked --all-targets -- --include-ignored` | **300 passed, 0 failed, 0 ignored**, including native terminal and optional Node/MCP/SDK fixtures |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `git diff --check` | Passed |
+
+Older automatic remembered-session recovery results below describe historical
+behavior superseded by this issue fix for interactive launches.
+
 ## v1.1.0 — Themes and issues #11–#14
 
 The combined implementation's Windows acceptance passed **298 Rust tests**

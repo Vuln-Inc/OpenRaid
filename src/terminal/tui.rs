@@ -1,7 +1,13 @@
 //! A live operator console. Board navigation is exclusively global cursor pagination.
 #[cfg(test)]
+#[path = "inspection_selection_tests.rs"]
+mod inspection_selection_tests;
+#[cfg(test)]
 #[path = "inspection_tests.rs"]
 mod inspection_tests;
+#[cfg(test)]
+#[path = "roster_tests.rs"]
+mod roster_tests;
 #[path = "selection.rs"]
 mod selection;
 use crate::{
@@ -122,6 +128,7 @@ struct UiState {
     after: u64,
     latest: u64,
     selected: usize,
+    roster_ids: Vec<String>,
     table: TableState,
     focus: Focus,
     board_scroll: u16,
@@ -175,6 +182,7 @@ impl Default for UiState {
             after: 0,
             latest: 0,
             selected: 0,
+            roster_ids: Vec::new(),
             table: TableState::default().with_selected(0),
             focus: Focus::Agents,
             board_scroll: 0,
@@ -224,6 +232,43 @@ impl Default for UiState {
 }
 
 impl UiState {
+    fn pane_selection_area(&self, pane: Rect) -> Rect {
+        if self.inspecting {
+            Block::default()
+                .borders(Borders::LEFT)
+                .padding(ratatui::widgets::Padding::horizontal(1))
+                .inner(pane)
+        } else {
+            pane.inner(ratatui::layout::Margin::new(1, 1))
+        }
+    }
+
+    fn reconcile_roster(&mut self, snapshot: &MetricsSnapshot) {
+        let previous = self.roster_ids.get(self.selected);
+        let selected = previous
+            .and_then(|id| snapshot.agents.iter().position(|agent| &agent.id == id))
+            .unwrap_or_else(|| self.selected.min(snapshot.agents.len().saturating_sub(1)));
+        let next = snapshot.agents.get(selected).map(|agent| &agent.id);
+        if previous.is_some() && previous != next {
+            self.detail_scroll = 0;
+            self.detail_follow = true;
+            self.inspection_scroll = 0;
+            self.inspection_follow = true;
+            self.selection.cancel();
+        }
+        self.selected = selected;
+        self.table
+            .select((!snapshot.agents.is_empty()).then_some(selected));
+        self.roster_ids = snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.id.clone())
+            .collect();
+        if snapshot.agents.is_empty() {
+            self.close_inspection();
+        }
+    }
+
     async fn load(&mut self, store: &Store) -> Result<()> {
         self.latest = store.latest_seq().await?;
         if self.follow {
@@ -1227,10 +1272,12 @@ async fn run_console(
                     app.load(&store).await?;
                     board_dirty = false;
                 }
-                let snapshot = metrics.snapshot();
+                let snapshot = match &manager {
+                    Some(manager) => metrics.snapshot_for_members(&manager.control.members()),
+                    None => metrics.snapshot(),
+                };
                 agent_count = snapshot.agents.len();
-                app.selected = app.selected.min(agent_count.saturating_sub(1));
-                app.table.select((agent_count > 0).then_some(app.selected));
+                app.reconcile_roster(&snapshot);
                 app.sample(&snapshot);
                 terminal.draw(|frame| {
                     draw(frame, &mut app, &snapshot, &metrics);
@@ -1349,7 +1396,7 @@ async fn run_console(
                         let point = (mouse.column, mouse.row).into();
                         let pane = app.grid_hits.iter().map(|(rect, _)| rect).chain(app.panels.iter())
                             .find(|rect| rect.contains(point));
-                        let area = pane.map(|rect| rect.inner(ratatui::layout::Margin::new(1, 1)))
+                        let area = pane.map(|rect| app.pane_selection_area(*rect))
                             .unwrap_or(rendered.area);
                         app.selection.start(&rendered, area, point);
                         left_pressed = true;
@@ -2114,17 +2161,26 @@ fn draw_inspection(
     metrics: &Metrics,
 ) {
     let palette = crate::theme::current_theme().palette;
+    let wide = frame.area().width >= 100 && frame.area().height >= 16;
+    let header_height = if frame.area().height < 10 { 1 } else { 3 };
+    let footer_height = if frame.area().height < 10 { 1 } else { 2 };
     let rows = Layout::vertical([
-        Constraint::Length(3),
+        Constraint::Length(header_height),
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(footer_height),
     ])
     .split(frame.area());
-    app.panels = [Rect::default(), Rect::default(), rows[1]];
+    let columns = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(if wide { 28 } else { 0 }),
+    ])
+    .split(rows[1]);
+    let transcript = columns[0];
+    app.panels = [Rect::default(), Rect::default(), transcript];
     app.grid_hits.clear();
     app.prompt_hits.clear();
     app.control_hits.clear();
-    app.inspection_page_size = usize::from(rows[1].height.saturating_sub(2)).max(1);
+    app.inspection_page_size = usize::from(transcript.height).max(1);
     let Some(agent) = snapshot.agents.get(app.selected) else {
         frame.render_widget(
             Paragraph::new("No agent activity is available. Esc returns to the dashboard.")
@@ -2136,55 +2192,52 @@ fn draw_inspection(
     };
     frame.render_widget(
         Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", agent.id),
+                    Style::default()
+                        .fg(palette.text)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ● {}", agent.status.label()),
+                    Style::default().fg(status_color(agent.status)),
+                ),
+                Span::styled("  / agent activity", Style::default().fg(palette.muted)),
+            ]),
+            if wide {
+                Line::styled(
+                    format!(" {} / {}", app.session.provider, app.session.model),
+                    Style::default().fg(palette.muted),
+                )
+            } else {
+                Line::styled(
+                    format!(
+                        " in {}  out {}  cached {}  tools {}  retries {}",
+                        agent.input_tokens,
+                        agent.output_tokens,
+                        agent.cached_tokens,
+                        agent.tools,
+                        agent.retries
+                    ),
+                    Style::default().fg(palette.muted),
+                )
+            },
             Line::styled(
-                format!(" {} — {}", agent.id, agent.status.label()),
-                Style::default()
-                    .fg(status_color(agent.status))
-                    .add_modifier(Modifier::BOLD),
+                format!(" {}", metrics.agent_detail(&agent.id)),
+                Style::default().fg(palette.muted),
             ),
-            Line::raw(format!(
-                " input {}  output {}  cached {}  tools {}  retries {}",
-                agent.input_tokens,
-                agent.output_tokens,
-                agent.cached_tokens,
-                agent.tools,
-                agent.retries
-            )),
-            Line::styled(
-                metrics.agent_detail(&agent.id),
-                Style::default().fg(palette.warning),
-            ),
-        ]),
+        ])
+        .style(Style::default().bg(palette.surface).fg(palette.text)),
         rows[0],
     );
     let activity = metrics.agent_activity(&agent.id);
-    let lines = if activity.is_empty() {
-        vec![Line::styled(
-            "Waiting for activity. Generation, tool executions and process output appear here.",
-            Style::default().fg(palette.muted),
-        )]
-    } else {
-        // Split exceptionally long physical lines into safe rendering segments.
-        // This also permits histories beyond Paragraph's u16 scroll range.
-        activity
-            .lines()
-            .flat_map(|line| {
-                let mut rest = line;
-                let mut segments = Vec::new();
-                while rest.len() > 8192 {
-                    let mut end = 8192;
-                    while !rest.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    segments.push(Line::raw(rest[..end].to_owned()));
-                    rest = &rest[end..];
-                }
-                segments.push(Line::raw(rest.to_owned()));
-                segments
-            })
-            .collect()
-    };
-    let width = rows[1].width.saturating_sub(2).max(1);
+    let lines = inspection_activity_lines(&activity, palette);
+    let transcript_block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(palette.accent))
+        .padding(ratatui::widgets::Padding::horizontal(1));
+    let width = transcript_block.inner(transcript).width.max(1);
     let line_heights: Vec<usize> = lines
         .iter()
         .map(|line| {
@@ -2210,35 +2263,181 @@ fn draw_inspection(
     }
     frame.render_widget(
         Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
+            .style(Style::default().fg(palette.text).bg(palette.background))
             .wrap(Wrap { trim: false })
             .scroll((remaining as u16, 0))
-            .block(block(
-                format!(
-                    " {} activity · {} · lines {}–{} / {} ",
-                    agent.id,
-                    if app.inspection_follow {
-                        "following"
-                    } else {
-                        "history"
-                    },
-                    app.inspection_scroll + 1,
-                    (app.inspection_scroll + app.inspection_page_size).min(total_lines),
-                    total_lines
-                ),
-                true,
-            )),
-        rows[1],
+            .block(transcript_block),
+        transcript,
     );
+    if wide {
+        let heading = Style::default()
+            .fg(palette.text)
+            .add_modifier(Modifier::BOLD);
+        let muted = Style::default().fg(palette.muted);
+        let mut sidebar = vec![
+            Line::styled("Session", heading),
+            Line::styled(app.session.provider.clone(), muted),
+            Line::raw(app.session.model.clone()),
+        ];
+        if !app.session.variant.is_empty() {
+            sidebar.push(Line::styled(app.session.variant.clone(), muted));
+        }
+        sidebar.extend([
+            Line::raw(""),
+            Line::styled("Usage", heading),
+            inspection_stat("Input", agent.input_tokens, palette),
+            inspection_stat("Output", agent.output_tokens, palette),
+            inspection_stat("Cached", agent.cached_tokens, palette),
+            Line::raw(""),
+            Line::styled("Activity", heading),
+            inspection_stat("Tools", agent.tools, palette),
+            inspection_stat("Retries", agent.retries, palette),
+        ]);
+        if columns[1].height < 14 {
+            sidebar.retain(|line| !line.spans.is_empty() && line.width() > 0);
+        }
+        frame.render_widget(
+            Paragraph::new(sidebar)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(palette.surface).fg(palette.text))
+                .block(Block::default().padding(ratatui::widgets::Padding::new(2, 1, 1, 0))),
+            columns[1],
+        );
+    }
     frame.render_widget(
         Paragraph::new(vec![
-            Line::styled(
-                " Esc/q dashboard · ↑/↓ scroll · PgUp/PgDn page · Home/End first/latest · f follow",
-                Style::default().fg(palette.success),
-            ),
-            Line::styled(app.notice.clone(), Style::default().fg(palette.warning)),
+            Line::from(vec![
+                Span::styled(
+                    if app.inspection_follow { " ● Following" } else { " ○ History" },
+                    Style::default().fg(if app.inspection_follow { palette.success } else { palette.warning }),
+                ),
+                Span::styled(
+                    format!("  {}–{} / {}", app.inspection_scroll + 1,
+                        (app.inspection_scroll + app.inspection_page_size).min(total_lines), total_lines),
+                    Style::default().fg(palette.muted),
+                ),
+                Span::styled(
+                    "  Esc back · f follow",
+                    Style::default().fg(palette.muted),
+                ),
+            ]),
+            if app.notice.is_empty() {
+                Line::styled(
+                    if frame.area().width < 80 {
+                        " ↑/↓ scroll · PgUp/PgDn page · Home/End first/latest"
+                    } else {
+                        " Esc/q dashboard · ↑/↓ scroll · PgUp/PgDn page · Home/End first/latest · f follow"
+                    },
+                    Style::default().fg(palette.muted),
+                )
+            } else {
+                Line::styled(app.notice.clone(), Style::default().fg(palette.warning))
+            },
         ]),
         rows[2],
     );
+}
+
+fn inspection_stat(label: &str, value: u64, palette: crate::theme::Palette) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<10}"), Style::default().fg(palette.muted)),
+        Span::styled(value.to_string(), Style::default().fg(palette.text)),
+    ])
+}
+
+/// Adapt OpenCode's separate text/tool surfaces to the complete activity spool.
+/// Only event markers at paragraph boundaries are presentation metadata; fenced
+/// code and tool/process payload retain their original text and whitespace.
+fn inspection_activity_lines(activity: &str, palette: crate::theme::Palette) -> Vec<Line<'static>> {
+    if activity.is_empty() {
+        return vec![
+            Line::styled(
+                "Waiting for activity",
+                Style::default()
+                    .fg(palette.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "Responses, tool runs and process output will appear here.",
+                Style::default().fg(palette.muted),
+            ),
+        ];
+    }
+    let mut lines = Vec::new();
+    let mut boundary = true;
+    let mut code_fence = false;
+    let mut tool_payload = false;
+    let mut response_heading = false;
+    for physical in activity.lines() {
+        let event = if boundary && !code_fence {
+            physical
+                .strip_prefix("[tool] ")
+                .map(|name| ("Tool run", name, palette.accent))
+                .or_else(|| {
+                    physical
+                        .strip_prefix("[result] ")
+                        .map(|name| ("Tool result", name, palette.success))
+                })
+                .or_else(|| {
+                    physical
+                        .strip_prefix("[status] ")
+                        .map(|text| ("Status", text, palette.muted))
+                })
+                .or_else(|| (physical == "[response]").then_some(("Response", "", palette.accent)))
+        } else {
+            None
+        };
+        if let Some((label, text, color)) = event {
+            tool_payload = matches!(label, "Tool run" | "Tool result");
+            response_heading = label == "Response";
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{label}  "),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    text.to_owned(),
+                    Style::default().fg(if tool_payload {
+                        palette.text
+                    } else {
+                        palette.muted
+                    }),
+                ),
+            ]));
+        } else {
+            if !physical.is_empty() && !tool_payload && !response_heading {
+                lines.push(Line::styled(
+                    "Response",
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                response_heading = true;
+            }
+            let style = if tool_payload || code_fence || physical.trim_start().starts_with("```") {
+                Style::default().fg(palette.text).bg(palette.surface)
+            } else {
+                Style::default().fg(palette.text)
+            };
+            // Bound each physical segment so residual Paragraph scroll stays u16-safe.
+            let mut rest = physical;
+            while rest.len() > 8192 {
+                let mut end = 8192;
+                while !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                lines.push(Line::styled(rest[..end].to_owned(), style));
+                rest = &rest[end..];
+            }
+            lines.push(Line::styled(rest.to_owned(), style));
+        }
+        if physical.trim_start().starts_with("```") {
+            code_fence = !code_fence;
+        }
+        boundary = physical.is_empty();
+    }
+    lines
 }
 
 fn popup(area: Rect, width: u16, height: u16) -> Rect {

@@ -7,10 +7,10 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.1.0-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.0)
+[![Version](https://img.shields.io/badge/version-1.1.1-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.1)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
-[![Verification](https://img.shields.io/badge/verified-298%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
+[![Verification](https://img.shields.io/badge/verified-316%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
 [**Quick start**](#install-and-launch) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
@@ -56,7 +56,7 @@ OpenRaid keeps the tool execution, coordination, checkpoints, and completion gat
 | **Evidence-based completion** | Revocable votes, a fresh 75% quorum, a stability grace period, then full worker drain |
 | **Native coding tools** | File reads, regex search, exact-context patches, commands, and interactive PTYs |
 | **Shared MCP connections** | Stdio and Streamable HTTP servers expose tools, resources, and prompts to the swarm |
-| **Durable recovery** | Unexpected worker exits resume the same identity; remembered unfinished sessions recover their task and roster |
+| **Durable recovery** | Unexpected worker exits resume the same identity; interrupted sessions can be explicitly resumed with their task, roster, and checkpoints |
 | **Prompt history and restoration** | Jump to sent prompts, copy them, or restore their draft and an available Git-backed workspace snapshot |
 
 ```text
@@ -140,12 +140,12 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.1.0 archive |
+| Platform | v1.1.1 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.1.0-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.1.0-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.1.0-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.1.0-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.1.1-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.1.1-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.1.1-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.1.1-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
 
@@ -198,7 +198,7 @@ The elapsed time varies. The default five-second consensus grace contributes to 
 
    > Implement pagination for the existing catalog endpoint. Read the current API and tests first, discuss the work on the shared board, preserve the public response format, and verify the implementation before voting done.
 
-After the task reaches consensus and drains, the guided console stays open for another prompt. Later `setup` launches reopen the most recently used session **in the current workspace** at an idle home. If that session contains unfinished work from an interruption or console close, setup resumes its task, durable roster, and checkpoints. Explicitly stopped work stays stopped.
+After the task reaches consensus and drains, the guided console stays open for another prompt. Later `setup` launches reopen the most recently used session **in the current workspace** at an idle home, including sessions with unfinished work from an interruption or console close. Opening a saved session does not start agents. Use `/start your objective` to start work, `/new` for fresh history, or launch with `setup --resume` to explicitly continue an interrupted task with its durable roster and checkpoints. Explicitly stopped work stays stopped.
 
 Use `run --select` when you want the full guided selection flow again. Explicit `run` and `demo` commands finish after their round drains.
 
@@ -228,9 +228,10 @@ openraid sessions                    # this directory's history
 openraid sessions --all              # sessions across workspaces
 openraid sessions --json             # machine-readable IDs and paths
 openraid setup --session SESSION_ID   # reopen its original workspace explicitly
+openraid setup --resume               # explicitly continue interrupted work
 ```
 
-The first session uses `.openraid/openraid.sqlite3` in the workspace, keeping its SQLite WAL/SHM files in the same folder. New sessions use separate databases under `.openraid/sessions/`. The default ignores an existing workspace-root `openraid.sqlite3`; existing databases are not automatically moved. Explicit `--database` paths and remembered session paths remain unchanged. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths. Existing databases and board history are retained.
+The first session uses `.openraid/openraid.sqlite3` in the workspace, keeping its SQLite WAL/SHM files in the same folder. New sessions use separate databases under `.openraid/sessions/`. Automatic reopening corrects legacy workspace-root `openraid.sqlite3` paths saved in launch profiles or the latest-session catalog to the nested default. Root database/WAL/SHM files are left untouched; existing history is not automatically moved or merged. To open old root history deliberately, use `--database openraid.sqlite3` or `--session SESSION_ID`. Custom database paths and explicit selections retain their behavior. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths.
 
 ### Run explicitly from the command line
 
@@ -340,6 +341,8 @@ The console shows the selected provider/model/variant, current roster, draining 
 
 Select an agent in the roster or tiled view, then press `Enter` from the agent list, tile, or selected-agent stream to open its full-screen activity. The inspector shows retained streamed generation, tool arguments and results, and process output beyond the dashboard's truncated previews.
 
+An OpenCode-inspired transcript separates responses, tool calls, results, and status with clear headings and themed payload surfaces. Wide terminals add a metadata sidebar with session, usage, and activity information; compact terminals prioritize the transcript and follow/history controls. Mouse-copy selection follows the transcript's visible text area.
+
 Use arrow keys or `j` / `k`, the mouse wheel, or `PageUp` / `PageDown` to browse activity. `Home` jumps to the beginning; `End` jumps to the latest output and resumes following. Press `f` to toggle following live output. `Esc` or `q` returns to the same dashboard or tiled view with the selected agent preserved.
 
 Full activity is spooled to temporary files during the running session, keeping
@@ -435,6 +438,7 @@ The selected theme is remembered globally and used by setup, the dashboard, menu
 - Once an objective has started, membership changes write durable global notices. Changes invalidate old votes atomically; initial roster setup stays silent.
 - Quorum and its grace period follow the current active roster.
 - Removal stops admission of new work for those workers. Already-started requests/tools finish; unstarted tool calls are recorded as skipped before the worker drains.
+- Removed agents disappear from the live roster on the next redraw, while draining work and historical usage/activity remain accounted for. Selection follows agent identity when earlier rows are removed.
 - IDs increase monotonically and are not reused within the durable allocation history.
 - At least one active member must remain. **Active plus still-draining workers cannot exceed 500.**
 - Changes during a committed completion drain are rejected; an attached persistent session makes them available again when idle.
@@ -630,7 +634,7 @@ The SQLite database stores the global board, prompts, active roster, votes, and 
 - An unexpected exit of an active worker restarts the **same logical identity** from its checkpoint and writes a recovery notice.
 - Removed workers remain retired. Workers finishing a committed consensus round do not restart.
 - `run … --resume` restores an interrupted durable session explicitly.
-- `setup` detects unfinished work in the selected workspace session automatically; completed and explicitly stopped prompts stay audit-only.
+- Interactive `setup` and session switching open saved history idle, even when work is unfinished. Use `/start` to submit an objective, `/new` for separate history, or `setup --resume` to explicitly continue interrupted work; completed and explicitly stopped prompts stay audit-only.
 - Pending tool groups are repaired without blindly replaying a command whose result was not durably recorded.
 
 Credentials/preferences are stored in `openraid/auth.json` under `XDG_DATA_HOME`, or `~/.local/share` when unset. `OPENRAID_AUTH_FILE` overrides that file. Launch profiles remember each workspace/session's model and settings rather than storing the previous objective or a session-only API key. Session metadata is stored in a sibling `sessions/` directory. OpenCode fallback credentials are read from the corresponding `opencode/auth.json`.
@@ -670,7 +674,7 @@ The recorded acceptance gate includes:
 
 | Check | Recorded result |
 | --- | --- |
-| Rust, including optional integration fixtures | **298 passed on Windows**, none failed or ignored |
+| Rust, including optional integration fixtures | **316 passed on Windows**, none failed or ignored |
 | Node SDK/transport/discovery tests | **25 passed** |
 | Native PTY tests | **8 Windows ConPTY cases; 9 Unix cases** |
 | OpenCode source audit | **23 custom loaders and 24 upstream adapter entries** accounted for |
@@ -678,7 +682,7 @@ The recorded acceptance gate includes:
 | Formatting and Clippy | Passed; Clippy warning-free |
 | Windows and Linux build/run scripts | Passed from outside the checkout, including 500-agent full drain |
 
-These checks cover local protocol behavior, real OS terminals, durable state, parallel membership, safe draining, liveness, and automatic recovery. They do not benchmark model quality, paid-cloud account access, or 500-agent live-provider throughput. The final source record also includes actual release-console walkthroughs for multiple prompt rounds, Unicode, custom connections, MCP status transitions, and completed-home no-replay.
+These checks cover local protocol behavior, real OS terminals, durable state, parallel membership, safe draining, liveness, and worker recovery. Current regressions verify idle reopening of unfinished sessions, explicit recovery, remembered legacy-path correction, immediate roster removal, and responsive inspector rendering and selection. They do not benchmark model quality, paid-cloud account access, or 500-agent live-provider throughput. The verification record also includes earlier release-console walkthroughs for multiple prompt rounds, Unicode, custom connections, MCP status transitions, and completed-home no-replay.
 
 Run the Rust checks:
 

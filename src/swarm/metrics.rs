@@ -24,6 +24,7 @@ struct ActivityLog {
     path: Option<PathBuf>,
     fallback: String,
     unavailable: bool,
+    response_boundary_needed: bool,
 }
 
 impl ActivityLog {
@@ -280,11 +281,19 @@ impl Metrics {
     }
 
     pub fn append_output(&self, agent_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         if let Some(slot) = self.slot(agent_id) {
-            slot.activity
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .append(text);
+            let mut activity = slot.activity.lock().unwrap_or_else(|e| e.into_inner());
+            // Separate the next response from tool/status payload once, never
+            // between streaming chunks or in the bounded generation preview.
+            if activity.response_boundary_needed {
+                activity.append("\n\n[response]\n");
+                activity.response_boundary_needed = false;
+            }
+            activity.append(text);
+            drop(activity);
             let mut preview = slot.stream.lock().unwrap_or_else(|e| e.into_inner());
             append_preview(&mut preview, text, STREAM_PREVIEW_BYTES);
         }
@@ -295,10 +304,9 @@ impl Metrics {
             let mut detail = slot.detail.lock().unwrap_or_else(|e| e.into_inner());
             let preview = tail(text, DETAIL_BYTES);
             if *detail != preview {
-                slot.activity
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .append(&format!("\n[status] {text}\n"));
+                let mut activity = slot.activity.lock().unwrap_or_else(|e| e.into_inner());
+                activity.append(&format!("\n\n[status] {text}\n"));
+                activity.response_boundary_needed = true;
                 *detail = preview.to_owned();
             }
         }
@@ -306,20 +314,22 @@ impl Metrics {
 
     /// Append tool/process activity without disturbing the dashboard's generation preview.
     pub fn append_activity(&self, agent_id: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
         if let Some(slot) = self.slot(agent_id) {
-            slot.activity
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .append(text);
+            let mut activity = slot.activity.lock().unwrap_or_else(|e| e.into_inner());
+            activity.append(text);
+            activity.response_boundary_needed = true;
         }
     }
 
     pub fn record_tool_start(&self, agent_id: &str, name: &str, arguments: &str) {
-        self.append_activity(agent_id, &format!("\n[tool] {name}\n{arguments}\n"));
+        self.append_activity(agent_id, &format!("\n\n[tool] {name}\n{arguments}\n"));
     }
 
     pub fn record_tool_result(&self, agent_id: &str, name: &str, result: &str) {
-        self.append_activity(agent_id, &format!("\n[result] {name}\n{result}\n"));
+        self.append_activity(agent_id, &format!("\n\n[result] {name}\n{result}\n"));
     }
 
     /// Load only the inspected agent's complete session activity from its spool.
@@ -357,6 +367,30 @@ impl Metrics {
                     .clone()
             })
             .unwrap_or_default()
+    }
+
+    /// Show the committed roster while retaining cumulative session telemetry.
+    /// Removed workers can keep draining and recording activity without remaining
+    /// in the live roster or contributing to its status counts.
+    pub fn snapshot_for_members(&self, members: &[String]) -> MetricsSnapshot {
+        let mut snapshot = self.snapshot();
+        snapshot.agents.retain(|agent| members.contains(&agent.id));
+        snapshot.active = snapshot
+            .agents
+            .iter()
+            .filter(|agent| matches!(agent.status, AgentStatus::Thinking | AgentStatus::Tool))
+            .count();
+        snapshot.voted = snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.status == AgentStatus::Voted)
+            .count();
+        snapshot.finished = snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.status == AgentStatus::Finished)
+            .count();
+        snapshot
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
