@@ -9,7 +9,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
@@ -25,6 +25,7 @@ pub struct Hub(Arc<Inner>);
 
 struct Inner {
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
+    generation: AtomicU64,
     processes: Arc<Semaphore>,
     capacity: usize,
     active: Arc<AtomicUsize>,
@@ -55,6 +56,83 @@ struct Session {
     state: Mutex<State>,
     input_ready: Condvar,
     monitor: Mutex<Option<JoinHandle<()>>>,
+    activity: Option<ProcessActivity>,
+    cancelled_spawn: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProcessActivity {
+    pub metrics: Arc<crate::metrics::Metrics>,
+    pub agent_id: String,
+}
+
+pub(crate) struct ExecutionContext {
+    pub generation: u64,
+    pub activity: Option<ProcessActivity>,
+    pub cancelled: Option<Arc<AtomicBool>>,
+}
+
+impl ProcessActivity {
+    pub fn writer(self) -> ProcessOutput {
+        ProcessOutput {
+            activity: self,
+            pending: Vec::new(),
+        }
+    }
+}
+
+/// Every pipe owns its decoder: reads may split a Unicode character, while
+/// stdout and stderr may concurrently end in different incomplete characters.
+pub(crate) struct ProcessOutput {
+    activity: ProcessActivity,
+    pending: Vec<u8>,
+}
+
+impl ProcessOutput {
+    pub fn append(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        let mut consumed = 0;
+        while consumed < self.pending.len() {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(text) => {
+                    self.activity
+                        .metrics
+                        .append_activity(&self.activity.agent_id, text);
+                    consumed = self.pending.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    if valid_end > consumed {
+                        let text = std::str::from_utf8(&self.pending[consumed..valid_end])
+                            .expect("validated UTF-8 prefix");
+                        self.activity
+                            .metrics
+                            .append_activity(&self.activity.agent_id, text);
+                    }
+                    consumed = valid_end;
+                    if let Some(length) = error.error_len() {
+                        self.activity
+                            .metrics
+                            .append_activity(&self.activity.agent_id, "\u{fffd}");
+                        consumed += length;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+    }
+
+    pub fn finish(&mut self) {
+        if !self.pending.is_empty() {
+            self.activity.metrics.append_activity(
+                &self.activity.agent_id,
+                &String::from_utf8_lossy(&self.pending),
+            );
+            self.pending.clear();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +151,7 @@ impl Hub {
         let (capacity_changed, _) = watch::channel(0);
         Self(Arc::new(Inner {
             sessions: Mutex::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
             capacity: processes.available_permits(),
             processes,
             active: Arc::new(AtomicUsize::new(0)),
@@ -120,6 +199,55 @@ impl Hub {
         workdir: &Path,
         output_dir: &Path,
     ) -> Result<Value> {
+        self.execute_at_generation(name, args, workdir, output_dir, self.generation())
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.0.generation.load(Ordering::Acquire)
+    }
+
+    /// Invalidate pending spawns before signalling every existing terminal.
+    /// Reaping/output draining continues on the terminal's monitor thread.
+    pub fn stop_all(&self) {
+        let sessions = {
+            let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            self.0.generation.fetch_add(1, Ordering::AcqRel);
+            sessions.values().cloned().collect::<Vec<_>>()
+        };
+        for session in sessions {
+            let _ = session.stop();
+        }
+    }
+
+    pub fn execute_at_generation(
+        &self,
+        name: &str,
+        args: &Value,
+        workdir: &Path,
+        output_dir: &Path,
+        generation: u64,
+    ) -> Result<Value> {
+        self.execute_with_activity(
+            name,
+            args,
+            workdir,
+            output_dir,
+            ExecutionContext {
+                generation,
+                activity: None,
+                cancelled: None,
+            },
+        )
+    }
+
+    pub(crate) fn execute_with_activity(
+        &self,
+        name: &str,
+        args: &Value,
+        workdir: &Path,
+        output_dir: &Path,
+        context: ExecutionContext,
+    ) -> Result<Value> {
         let allowed: &[&str] = match name {
             "pty_spawn" => &[
                 "program", "args", "command", "shell", "workdir", "rows", "cols",
@@ -140,7 +268,14 @@ impl Hub {
             }
         }
         if name == "pty_spawn" {
-            return self.spawn(args, workdir, output_dir);
+            return self.spawn(
+                args,
+                workdir,
+                output_dir,
+                context.generation,
+                context.activity,
+                context.cancelled,
+            );
         }
         if name == "pty_list" {
             let sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -249,7 +384,22 @@ impl Hub {
             .with_context(|| format!("unknown PTY session: {id}"))
     }
 
-    fn spawn(&self, args: &Value, workdir: &Path, output_dir: &Path) -> Result<Value> {
+    fn spawn(
+        &self,
+        args: &Value,
+        workdir: &Path,
+        output_dir: &Path,
+        generation: u64,
+        activity: Option<ProcessActivity>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<Value> {
+        if generation != self.generation()
+            || cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            bail!("PTY spawn cancelled by owner stop");
+        }
         if let Some(value) = args.get("workdir") {
             value.as_str().context("workdir must be a string")?;
         }
@@ -306,6 +456,8 @@ impl Hub {
             }),
             input_ready: Condvar::new(),
             monitor: Mutex::new(None),
+            activity,
+            cancelled_spawn: cancelled.clone(),
         });
         let drain_session = session.clone();
         let drain = thread::spawn(move || drain_output(reader, file, &drain_session));
@@ -313,11 +465,20 @@ impl Hub {
         let monitor = thread::spawn(move || monitor_child(&monitor_session, drain, permit));
         *session.monitor.lock().unwrap_or_else(|e| e.into_inner()) = Some(monitor);
         let info = session.info();
-        self.0
-            .sessions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, session);
+        let mut sessions = self.0.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if generation != self.generation()
+            || cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            drop(sessions);
+            // spawn_blocking cannot be aborted once admitted. A stop racing OS
+            // creation must therefore terminate the newly created child itself.
+            let _ = session.stop();
+            session.join();
+            bail!("PTY spawn cancelled by owner stop");
+        }
+        sessions.insert(id, session);
         Ok(info)
     }
 }
@@ -388,6 +549,13 @@ impl Drop for Inner {
 
 fn monitor_child(session: &Session, drain: JoinHandle<()>, permit: PtyPermit) {
     loop {
+        if session
+            .cancelled_spawn
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            let _ = session.stop();
+        }
         let status = session
             .child
             .lock()
@@ -480,6 +648,7 @@ fn kill_process_group(pid: u32) -> Result<bool> {
 fn drain_output(mut reader: Box<dyn Read + Send>, mut file: File, session: &Session) {
     let mut buffer = [0u8; 8192];
     let mut disk_error = None;
+    let mut activity = session.activity.clone().map(ProcessActivity::writer);
     #[cfg(windows)]
     let mut cursor_query = Vec::new();
     #[cfg(windows)]
@@ -488,6 +657,9 @@ fn drain_output(mut reader: Box<dyn Read + Send>, mut file: File, session: &Sess
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => {
+                if let Some(activity) = &mut activity {
+                    activity.append(&buffer[..n]);
+                }
                 // portable-pty enables INHERIT_CURSOR on ConPTY. Without its
                 // initial DSR response the console host can wait forever before
                 // starting normal output. Our headless terminal starts at 1,1.
@@ -528,6 +700,9 @@ fn drain_output(mut reader: Box<dyn Read + Send>, mut file: File, session: &Sess
                 break;
             }
         }
+    }
+    if let Some(activity) = &mut activity {
+        activity.finish();
     }
     if let Err(error) = file.flush() {
         disk_error.get_or_insert(error.to_string());
@@ -640,4 +815,31 @@ fn hex(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 15) as usize] as char);
     }
     output
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn process_activity_preserves_split_unicode_and_independent_pipe_decoders() {
+        let metrics = Arc::new(crate::metrics::Metrics::new(1));
+        let activity = ProcessActivity {
+            metrics: metrics.clone(),
+            agent_id: "agent-001".into(),
+        };
+        let mut stdout = activity.clone().writer();
+        let mut stderr = activity.writer();
+        stdout.append(&[0xf0, 0x9f]);
+        stderr.append(&[0xce]);
+        assert_eq!(metrics.agent_activity("agent-001"), "");
+        stdout.append(&[0x99, 0x82]);
+        stderr.append(&[0xbb]);
+        stdout.append(&[0xff, b'!', 0xe2]);
+        stdout.finish();
+        stderr.finish();
+        assert_eq!(metrics.agent_activity("agent-001"), "🙂λ\u{fffd}!\u{fffd}");
+        assert!(stdout.pending.is_empty());
+        assert!(stderr.pending.is_empty());
+    }
 }

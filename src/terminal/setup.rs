@@ -1,4 +1,5 @@
 //! Search-first, keyboard-native launch controls shared by the setup wizard.
+use crate::theme::{current_palette, Palette};
 use anyhow::{bail, Result};
 use crossterm::{
     event::{
@@ -11,19 +12,12 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io::{self, IsTerminal, Stdout};
-
-const INK: Color = Color::Rgb(21, 38, 56);
-const PAPER: Color = Color::Rgb(220, 231, 239);
-const ACCENT: Color = Color::Rgb(168, 184, 255);
-const SEA: Color = Color::Rgb(121, 201, 187);
-const MUTED: Color = Color::Rgb(143, 163, 184);
-const AMBER: Color = Color::Rgb(232, 186, 120);
 
 #[derive(Clone, Debug)]
 pub struct Choice {
@@ -161,7 +155,8 @@ impl SetupUi {
         let mut value = initial.to_owned();
         loop {
             self.terminal.draw(|frame| {
-                let rows = shell(frame, title, help);
+                let palette = current_palette();
+                let rows = shell(frame, title, help, palette);
                 let display = if secret {
                     "•".repeat(value.chars().count())
                 } else {
@@ -170,11 +165,14 @@ impl SetupUi {
                 let inner_width = rows[2].width.saturating_sub(4).max(1);
                 let paragraph = Paragraph::new(format!("{display}▏"))
                     .wrap(Wrap { trim: false })
-                    .block(panel(if secret {
-                        " API key · hidden "
-                    } else {
-                        " Type here "
-                    }));
+                    .block(panel(
+                        if secret {
+                            " API key · hidden "
+                        } else {
+                            " Type here "
+                        },
+                        palette,
+                    ));
                 let scroll = paragraph
                     .line_count(inner_width)
                     .saturating_sub(usize::from(rows[2].height.saturating_sub(2)))
@@ -186,7 +184,7 @@ impl SetupUi {
                     } else {
                         " Enter continue   Esc back   Ctrl+U clear   Ctrl+C cancel "
                     })
-                    .style(Style::default().fg(MUTED)),
+                    .style(Style::default().fg(palette.muted)),
                     rows[3],
                 );
             })?;
@@ -238,14 +236,15 @@ impl SetupUi {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
         loop {
             self.terminal.draw(|frame| {
-                let rows = shell(frame, "Connect your account", "Open the link in your browser and enter the code. Your terminal waits for confirmation.");
+                let palette = current_palette();
+                let rows = shell(frame, "Connect your account", "Open the link in your browser and enter the code. Your terminal waits for confirmation.", palette);
                 frame.render_widget(Paragraph::new(vec![
-                    Line::styled(verification_uri.to_owned(), Style::default().fg(ACCENT)),
+                    Line::styled(verification_uri.to_owned(), Style::default().fg(palette.accent)),
                     Line::raw(""),
-                    Line::styled(format!("Sign-in code: {user_code}"), Style::default().fg(SEA).add_modifier(Modifier::BOLD)),
-                    Line::raw(""), Line::styled("Waiting for sign-in…", Style::default().fg(MUTED)),
-                ]).wrap(Wrap { trim:false }).block(panel(" Browser sign-in ")), rows[2]);
-                frame.render_widget(Paragraph::new(" Esc / Ctrl+C cancel sign-in ").style(Style::default().fg(MUTED)), rows[3]);
+                    Line::styled(format!("Sign-in code: {user_code}"), Style::default().fg(palette.success).add_modifier(Modifier::BOLD)),
+                    Line::raw(""), Line::styled("Waiting for sign-in…", Style::default().fg(palette.muted)),
+                ]).wrap(Wrap { trim:false }).block(panel(" Browser sign-in ", palette)), rows[2]);
+                frame.render_widget(Paragraph::new(" Esc / Ctrl+C cancel sign-in ").style(Style::default().fg(palette.muted)), rows[3]);
             })?;
             tokio::select! {
                 result = &mut wait => return result.map(Some),
@@ -276,21 +275,22 @@ fn filter_choices<'a>(choices: &'a [Choice], query: &str) -> Vec<&'a Choice> {
         .collect()
 }
 
-fn panel(title: &str) -> Block<'_> {
+fn panel(title: &str, palette: Palette) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(MUTED))
+        .border_style(Style::default().fg(palette.border))
 }
 
 fn shell(
     frame: &mut Frame<'_>,
     title: &str,
     subtitle: &str,
+    palette: Palette,
 ) -> std::rc::Rc<[ratatui::layout::Rect]> {
     let area = frame.area();
     frame.render_widget(
-        Block::default().style(Style::default().bg(INK).fg(PAPER)),
+        Block::default().style(Style::default().bg(palette.background).fg(palette.text)),
         area,
     );
     let heading_height = (subtitle.lines().count() as u16 + 2).clamp(4, 8);
@@ -310,9 +310,11 @@ fn shell(
                 } else {
                     " openraid "
                 },
-                Style::default().fg(SEA).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette.success)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" / launch a swarm", Style::default().fg(MUTED)),
+            Span::styled(" / launch a swarm", Style::default().fg(palette.muted)),
         ])),
         rows[0],
     );
@@ -320,7 +322,9 @@ fn shell(
         Paragraph::new(vec![
             Line::styled(
                 title.to_owned(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
             ),
             Line::raw(subtitle.to_owned()),
         ])
@@ -339,17 +343,20 @@ fn draw_picker(
     state: &mut ListState,
     notice: &str,
 ) {
-    let rows = shell(frame, title, subtitle);
+    let palette = current_palette();
+    let rows = shell(frame, title, subtitle, palette);
     let body = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(rows[2]);
     frame.render_widget(
-        Paragraph::new(format!(" {query}▏"))
-            .block(panel(&format!(" Search · {} matches ", choices.len()))),
+        Paragraph::new(format!(" {query}▏")).block(panel(
+            &format!(" Search · {} matches ", choices.len()),
+            palette,
+        )),
         body[0],
     );
     if choices.is_empty() {
         frame.render_widget(
             Paragraph::new(" No matches. Backspace edits your search; Ctrl+U clears it.")
-                .style(Style::default().fg(AMBER)),
+                .style(Style::default().fg(palette.warning)),
             body[1],
         );
     } else {
@@ -359,19 +366,22 @@ fn draw_picker(
                     Span::styled(
                         choice.name.clone(),
                         Style::default().fg(if choice.disabled_reason.is_some() {
-                            MUTED
+                            palette.muted
                         } else {
-                            PAPER
+                            palette.text
                         }),
                     ),
-                    Span::styled(format!("  {}", choice.id), Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("  {}", choice.id),
+                        Style::default().fg(palette.muted),
+                    ),
                 ]),
                 Line::styled(
                     format!(
                         "  {}",
                         choice.disabled_reason.as_deref().unwrap_or(&choice.detail)
                     ),
-                    Style::default().fg(MUTED),
+                    Style::default().fg(palette.muted),
                 ),
             ])
         });
@@ -379,7 +389,8 @@ fn draw_picker(
             List::new(items)
                 .highlight_style(
                     Style::default()
-                        .bg(Color::Rgb(48, 66, 87))
+                        .bg(palette.selection)
+                        .fg(palette.selection_text)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("› "),
@@ -391,9 +402,9 @@ fn draw_picker(
         Paragraph::new(vec![
             Line::styled(
                 " Type to search   ↑/↓ select   Enter continue   Esc back   Ctrl+C cancel",
-                Style::default().fg(SEA),
+                Style::default().fg(palette.success),
             ),
-            Line::styled(notice.to_owned(), Style::default().fg(AMBER)),
+            Line::styled(notice.to_owned(), Style::default().fg(palette.warning)),
         ]),
         rows[3],
     );

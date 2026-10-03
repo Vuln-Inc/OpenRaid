@@ -1,9 +1,11 @@
 use crate::quick::Entry;
+use crate::theme::{self, Palette};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -19,6 +21,7 @@ pub enum Kind {
     ClearBoard,
     Connect,
     Models,
+    Themes,
     Variants,
     Jump,
     Prompt(u64),
@@ -48,6 +51,8 @@ pub enum Action {
     InvalidCommand(String),
     ToggleMcp(String),
     Models,
+    Themes,
+    SelectTheme(String),
     Connect,
     Variants,
     Cycle,
@@ -77,6 +82,7 @@ pub struct Menu {
     pub query: String,
     pub selected: usize,
     pub marked: std::collections::BTreeSet<String>,
+    pub active_theme: Option<String>,
 }
 pub enum Outcome {
     None,
@@ -123,6 +129,11 @@ pub fn command(text: &str) -> Option<Action> {
                 .unwrap_or(Action::Models),
         ),
         "/connect" => Some(Action::Connect),
+        "/themes" | "/theme" => Some(match words.next() {
+            None => Action::Themes,
+            Some(id) if words.next().is_none() => Action::SelectTheme(id.into()),
+            Some(_) => Action::InvalidCommand("Usage: /themes [theme-id]".into()),
+        }),
         "/mcp" => Some(Action::Mcp),
         "/members" => Some(Action::Members),
         "/add" => {
@@ -176,7 +187,26 @@ impl Menu {
             query: String::new(),
             selected,
             marked: Default::default(),
+            active_theme: None,
         }
+    }
+    pub fn themes(active_id: &str) -> Self {
+        let active = theme::find_theme(active_id).unwrap_or_else(theme::current_theme);
+        let entries = theme::THEMES
+            .iter()
+            .map(|theme| Entry {
+                id: theme.id.into(),
+                label: theme.name.into(),
+                detail: format!(
+                    "{} · {}",
+                    if theme.dark { "Dark" } else { "Light" },
+                    theme.description
+                ),
+            })
+            .collect();
+        let mut menu = Self::new(Kind::Themes, entries, Some(active.id));
+        menu.active_theme = Some(active.id.into());
+        menu
     }
     pub fn commands() -> Self {
         Self::new(
@@ -210,7 +240,7 @@ impl Menu {
                 (
                     "/stop",
                     "Stop current work",
-                    "Ctrl+X X · drain current operations and return idle",
+                    "Ctrl+X X · immediately cancel agents and active operations; return idle",
                 ),
                 (
                     "/members",
@@ -258,6 +288,11 @@ impl Menu {
                     "Ctrl+X then C · save a key securely",
                 ),
                 (
+                    "/themes",
+                    "Choose your terminal theme",
+                    "Preview ten dark and light palettes · /themes theme-id applies directly",
+                ),
+                (
                     "/variant",
                     "Choose thinking depth",
                     "Ctrl+X then T · Ctrl+T cycles variants",
@@ -270,7 +305,7 @@ impl Menu {
                 (
                     "/agents",
                     "Toggle tiled agents",
-                    "Watch the whole swarm in a paged grid",
+                    "Watch the whole swarm in a paged grid · Enter inspects full agent activity",
                 ),
                 (
                     "/help",
@@ -300,7 +335,13 @@ impl Menu {
             .iter()
             .filter(|entry| {
                 let text = format!("{} {} {}", entry.id, entry.label, entry.detail).to_lowercase();
-                query.split_whitespace().all(|word| text.contains(word))
+                query.split_whitespace().all(|word| {
+                    if matches!(self.kind, Kind::Themes) && matches!(word, "dark" | "light") {
+                        return theme::find_theme(&entry.id)
+                            .is_some_and(|theme| theme.dark == (word == "dark"));
+                    }
+                    text.contains(word)
+                })
             })
             .collect();
         if matches!(self.kind, Kind::Commands) {
@@ -373,6 +414,8 @@ impl Menu {
             KeyCode::PageDown => {
                 self.selected = (self.selected + 10).min(self.filtered().len().saturating_sub(1))
             }
+            KeyCode::Home => self.selected = 0,
+            KeyCode::End => self.selected = self.filtered().len().saturating_sub(1),
             KeyCode::Enter => {
                 if matches!(self.kind, Kind::Commands) && self.query.split_whitespace().count() > 1
                 {
@@ -446,6 +489,7 @@ impl Menu {
                     Kind::Sessions => Outcome::Action(Action::OpenSession(entry.id.clone())),
                     Kind::Connect => Outcome::Provider(entry.id.clone()),
                     Kind::Models => Outcome::Action(Action::SelectModel(entry.id.clone())),
+                    Kind::Themes => Outcome::Action(Action::SelectTheme(entry.id.clone())),
                     Kind::Mcp => Outcome::Action(Action::ToggleMcp(entry.id.clone())),
                     Kind::Members if entry.id == "add" => Outcome::Action(Action::AddList),
                     Kind::Members | Kind::RemoveAgents => {
@@ -466,6 +510,7 @@ impl Menu {
         Outcome::None
     }
     pub fn draw(&self, frame: &mut Frame<'_>) {
+        let palette = theme::current_theme().palette;
         let area = frame.area();
         let width = area.width.saturating_sub(4).min(100);
         let height = area.height.saturating_sub(4).min(24);
@@ -475,6 +520,10 @@ impl Menu {
             width,
             height,
         );
+        if matches!(self.kind, Kind::Themes) {
+            self.draw_themes(frame, popup, palette);
+            return;
+        }
         let (title, help) = match &self.kind {
             Kind::Board => (" Messageboard controls ", "Export includes every message, not only the visible page"),
             Kind::ClearBoard => (" WARNING: permanently clear history? ", "Deletes messages, prompts/snapshots, checkpoints and votes. Workspace and roster remain. Esc cancels."),
@@ -504,6 +553,7 @@ impl Menu {
                 " /models · connected providers ",
                 "Search provider/model names · Enter switch · Esc close",
             ),
+            Kind::Themes => unreachable!("theme picker has its own layout"),
             Kind::Variants => (
                 " /variant · thinking ",
                 "Enter select · Ctrl+T cycles available variants",
@@ -533,12 +583,8 @@ impl Menu {
         let block = Block::new()
             .borders(Borders::ALL)
             .title(title)
-            .style(
-                Style::default()
-                    .bg(Color::Rgb(21, 38, 56))
-                    .fg(Color::Rgb(220, 231, 239)),
-            )
-            .border_style(Style::default().fg(Color::Rgb(168, 184, 255)));
+            .style(Style::default().bg(palette.surface).fg(palette.text))
+            .border_style(Style::default().fg(palette.accent));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
         let rows = Layout::vertical([
@@ -549,7 +595,7 @@ impl Menu {
         ])
         .split(inner);
         frame.render_widget(
-            Paragraph::new(help).style(Style::default().fg(Color::Rgb(143, 163, 184))),
+            Paragraph::new(help).style(Style::default().fg(palette.muted)),
             rows[0],
         );
         let query = if matches!(self.kind, Kind::Key { .. }) {
@@ -558,13 +604,16 @@ impl Menu {
             self.query.clone()
         };
         frame.render_widget(
-            Paragraph::new(format!("{query}▏")).block(Block::new().borders(Borders::ALL).title(
-                if matches!(self.kind, Kind::Key { .. }) {
-                    " Key · hidden "
-                } else {
-                    " Search / input "
-                },
-            )),
+            Paragraph::new(format!("{query}▏")).block(
+                Block::new()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(palette.border))
+                    .title(if matches!(self.kind, Kind::Key { .. }) {
+                        " Key · hidden "
+                    } else {
+                        " Search / input "
+                    }),
+            ),
             rows[1],
         );
         if !matches!(
@@ -608,7 +657,8 @@ impl Menu {
                 List::new(items)
                     .highlight_style(
                         Style::default()
-                            .bg(Color::Rgb(48, 66, 87))
+                            .bg(palette.selection)
+                            .fg(palette.selection_text)
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol("› "),
@@ -632,10 +682,151 @@ impl Menu {
                     } else {
                         "↑/↓ choose · Enter select · Esc back".into()
                     },
-                ),
+                )
+                .style(Style::default().fg(palette.muted)),
                 rows[3],
             );
         }
+    }
+
+    fn draw_themes(&self, frame: &mut Frame<'_>, popup: Rect, palette: Palette) {
+        frame.render_widget(Clear, popup);
+        let block = Block::bordered()
+            .title(" /themes · choose a palette ")
+            .style(Style::default().bg(palette.surface).fg(palette.text))
+            .border_style(Style::default().fg(palette.accent));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+        frame.render_widget(
+            Paragraph::new("Browse a preview; Enter saves your choice.")
+                .style(Style::default().fg(palette.muted)),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(format!("{}▏", self.query)).block(
+                Block::bordered()
+                    .title(" Search names / dark / light ")
+                    .border_style(Style::default().fg(palette.border)),
+            ),
+            rows[1],
+        );
+        let filtered = self.filtered();
+        let selected = self.selected.min(filtered.len().saturating_sub(1));
+        let candidate = filtered
+            .get(selected)
+            .and_then(|entry| theme::find_theme(&entry.id));
+        let (list_area, preview_area) = if rows[2].width >= 74 {
+            let panes =
+                Layout::horizontal([Constraint::Length(32), Constraint::Min(1)]).split(rows[2]);
+            (panes[0], Some(panes[1]))
+        } else if rows[2].height >= 12 {
+            let panes =
+                Layout::vertical([Constraint::Min(5), Constraint::Length(7)]).split(rows[2]);
+            (panes[0], Some(panes[1]))
+        } else {
+            (rows[2], None)
+        };
+        if filtered.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No matching themes. Clear the search with Ctrl+U.")
+                    .style(Style::default().fg(palette.muted))
+                    .wrap(Wrap { trim: true }),
+                list_area,
+            );
+        } else {
+            let items: Vec<_> = filtered
+                .iter()
+                .map(|entry| {
+                    let active = self.active_theme.as_deref() == Some(entry.id.as_str());
+                    ListItem::new(Line::from(vec![Span::raw(format!(
+                        "{}{}",
+                        entry.label,
+                        if active { " ✓" } else { "" }
+                    ))]))
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some(selected));
+            frame.render_stateful_widget(
+                List::new(items).highlight_symbol("› ").highlight_style(
+                    Style::default()
+                        .bg(palette.selection)
+                        .fg(palette.selection_text)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                list_area,
+                &mut state,
+            );
+        }
+        if let (Some(preview_area), Some(candidate)) = (preview_area, candidate) {
+            let p = candidate.palette;
+            let compact = preview_area.height < 10;
+            let mut lines = vec![
+                Line::styled(candidate.description, Style::default().fg(p.muted)),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled("● Working", Style::default().fg(p.success)),
+                    Span::styled("  ◐ Waiting", Style::default().fg(p.warning)),
+                ]),
+            ];
+            if !compact {
+                lines.extend([
+                    Line::styled(
+                        "Swarm / agent-01",
+                        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw("Reviewing workspace changes…"),
+                    Line::styled("Shared board · 10 agents", Style::default().fg(p.muted)),
+                    Line::raw(""),
+                    Line::styled(
+                        "› Selected agent",
+                        Style::default()
+                            .bg(p.selection)
+                            .fg(p.selection_text)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Line::styled("! Request needs attention", Style::default().fg(p.error)),
+                ]);
+            }
+            lines.push(Line::styled(
+                "Prompt › Build something good▏",
+                Style::default().fg(p.accent),
+            ));
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .style(Style::default().bg(p.background).fg(p.text))
+                    .block(
+                        Block::bordered()
+                            .title(format!(
+                                " {} · {} preview ",
+                                candidate.name,
+                                if candidate.dark { "dark" } else { "light" }
+                            ))
+                            .border_style(Style::default().fg(p.border)),
+                    )
+                    .wrap(Wrap { trim: false }),
+                preview_area,
+            );
+        }
+        let footer = candidate.map_or_else(
+            || "Ctrl+U clear search · Esc cancel".to_owned(),
+            |candidate| {
+                format!(
+                    "↑/↓ browse · Enter apply · Esc cancel · {} · ✓ current",
+                    candidate.id
+                )
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(palette.muted)),
+            rows[3],
+        );
     }
 }
 

@@ -138,14 +138,25 @@ fn spawn_bridge_at(script: PathBuf, max_response_bytes: usize) -> Result<mpsc::S
     let mut output = BufReader::new(stdout);
     let (sender, mut jobs) = mpsc::channel::<Job>(128);
     tokio::spawn(async move {
+        let (cancel_tx, mut cancellations) = mpsc::unbounded_channel::<u64>();
         let mut pending = BTreeMap::<u64, oneshot::Sender<Reply>>::new();
         let mut id = 0_u64;
         let mut responded = false;
         let mut output_buffer = Vec::new();
         let failure = loop {
             tokio::select! {
+                biased;
+                Some(cancelled) = cancellations.recv() => {
+                    if pending.remove(&cancelled).is_some() {
+                        let payload = format!("{{\"cancel\":{cancelled}}}\n");
+                        if input.write_all(payload.as_bytes()).await.is_err() {
+                            break ("SDK bridge input closed during cancellation", responded);
+                        }
+                    }
+                }
                 job = jobs.recv() => {
-                    let Some((request, reply)) = job else { break ("SDK bridge closed", false); };
+                    let Some((request, mut reply)) = job else { break ("SDK bridge closed", false); };
+                    if reply.is_closed() { continue; }
                     id = id.wrapping_add(1);
                     let mut payload = match serde_json::to_vec(&json!({"id":id,"request":request})) {
                         Ok(payload) => payload,
@@ -156,7 +167,21 @@ fn spawn_bridge_at(script: PathBuf, max_response_bytes: usize) -> Result<mpsc::S
                         continue;
                     }
                     payload.push(b'\n');
-                    pending.insert(id, reply);
+                    // The sidecar outlives individual workers. Observe dropped
+                    // callers and cancel only their multiplexed generation.
+                    let request_id = id;
+                    let cancellation = cancel_tx.clone();
+                    let (result_tx, result_rx) = oneshot::channel();
+                    pending.insert(id, result_tx);
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            _ = reply.closed() => { let _ = cancellation.send(request_id); }
+                            result = result_rx => {
+                                if let Ok(result) = result { let _ = reply.send(result); }
+                            }
+                        }
+                    });
                     if input.write_all(&payload).await.is_err() {
                         break ("SDK bridge input closed; verify Node.js and bridge dependencies", responded);
                     }
@@ -233,6 +258,68 @@ pub fn script_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires Node.js 22.12+; exercises actual sidecar request cancellation"]
+    async fn dropped_caller_cancels_sidecar_request_without_stopping_other_requests() -> Result<()>
+    {
+        let directory = tempfile::tempdir()?;
+        let script = directory.path().join("cancellation.mjs");
+        std::fs::write(
+            &script,
+            r#"
+import {createInterface} from 'node:readline';
+const started = new Set();
+const cancelled = new Set();
+for await (const line of createInterface({input:process.stdin})) {
+  const {id,request,cancel}=JSON.parse(line);
+  if (cancel !== undefined) { cancelled.add(cancel); continue; }
+  if (request.pending) { started.add(id); continue; }
+  process.stdout.write(JSON.stringify({id,completion:{content:JSON.stringify({started:started.size,cancelled:cancelled.size}),tool_calls:[],usage:{input_tokens:1,output_tokens:1,cached_tokens:0},finish_reason:'stop'}})+'\n');
+}
+"#,
+        )?;
+        let sender = spawn_bridge_at(script, 4096)?;
+        let (pending_reply, pending_receive) = oneshot::channel();
+        sender
+            .send((json!({"pending": true}), pending_reply))
+            .await?;
+        let (closed_reply, closed_receive) = oneshot::channel();
+        drop(closed_receive);
+        sender
+            .send((json!({"pending": true}), closed_reply))
+            .await?;
+
+        async fn counts(sender: &mpsc::Sender<Job>) -> Result<Value> {
+            let (reply, receive) = oneshot::channel();
+            sender.send((json!({}), reply)).await?;
+            let completion = receive
+                .await?
+                .map_err(|failure| anyhow::anyhow!(failure.message))?;
+            Ok(serde_json::from_str(&completion.content)?)
+        }
+
+        let admitted = counts(&sender).await?;
+        assert_eq!(
+            admitted["started"], 1,
+            "queued closed caller must be skipped"
+        );
+        assert_eq!(admitted["cancelled"], 0);
+        drop(pending_receive);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if counts(&sender).await?["cancelled"] == 1 {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        let remaining = counts(&sender).await?;
+        assert_eq!(remaining["started"], 1);
+        assert_eq!(remaining["cancelled"], 1);
+        assert!(!sender.is_closed(), "shared bridge remains available");
+        Ok(())
+    }
 
     #[tokio::test]
     #[ignore = "requires Node.js 22.12+; exercises actual sidecar process lifecycle"]

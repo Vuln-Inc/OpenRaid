@@ -6,15 +6,9 @@ use std::{
 };
 
 /// Keep SQLite and its WAL/SHM sidecars together inside the workspace.
-/// Existing root-level stores remain usable without moving a potentially live database.
+/// Root-level databases are ignored unless selected explicitly.
 pub fn default_database_path(workspace: &Path) -> PathBuf {
-    let database = workspace.join(".openraid").join("openraid.sqlite3");
-    let legacy = workspace.join("openraid.sqlite3");
-    if !database.is_file() && legacy.is_file() {
-        legacy
-    } else {
-        database
-    }
+    workspace.join(".openraid").join("openraid.sqlite3")
 }
 
 /// Shared settings for the single-process swarm. The grace period applies only
@@ -128,7 +122,7 @@ mod tests {
     use super::default_database_path;
 
     #[test]
-    fn default_store_is_nested_and_legacy_store_remains_available() {
+    fn default_store_is_nested_even_when_root_store_exists() {
         let directory = tempfile::tempdir().unwrap();
         let nested = directory.path().join(".openraid").join("openraid.sqlite3");
         let legacy = directory.path().join("openraid.sqlite3");
@@ -136,7 +130,9 @@ mod tests {
         assert!(!nested.parent().unwrap().exists());
 
         std::fs::write(&legacy, "legacy").unwrap();
-        assert_eq!(default_database_path(directory.path()), legacy);
+        assert_eq!(default_database_path(directory.path()), nested);
+        assert!(!nested.parent().unwrap().exists());
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy");
 
         std::fs::create_dir(nested.parent().unwrap()).unwrap();
         std::fs::write(&nested, "nested").unwrap();

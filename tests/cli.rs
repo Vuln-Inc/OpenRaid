@@ -89,14 +89,30 @@ fn default_database_and_owner_commands_share_workspace_storage_directory() {
 }
 
 #[test]
-fn legacy_root_database_remains_accessible_to_default_launch_and_owner_commands() {
+fn default_launch_and_owner_commands_ignore_existing_legacy_root_database() {
     let directory = tempfile::tempdir().unwrap();
     let workspace = directory.path();
     let legacy = workspace.join("openraid.sqlite3");
     demo_in_workspace(workspace, Some(&legacy));
+    let legacy_message = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["post", "legacy database owner message", "--database"])
+            .arg(&legacy)
+            .output()
+            .unwrap(),
+    );
+    // Explicit root-database use may leave SQLite sidecars when the CLI exits.
+    // Default operations must not create, remove, or modify any of those files.
+    let legacy_files = [
+        "openraid.sqlite3",
+        "openraid.sqlite3-wal",
+        "openraid.sqlite3-shm",
+    ]
+    .map(|name| (name, std::fs::read(workspace.join(name)).ok()));
+    demo_in_workspace(workspace, None);
     let injected = successful_json(
         isolated_workspace_command(workspace)
-            .args(["post", "legacy database owner message"])
+            .args(["post", "nested database owner message"])
             .output()
             .unwrap(),
     );
@@ -108,18 +124,45 @@ fn legacy_root_database_remains_accessible_to_default_launch_and_owner_commands(
             .unwrap(),
     );
     assert!(board.as_array().unwrap().contains(&injected));
-    assert!(!workspace.join(".openraid/openraid.sqlite3").exists());
+    assert!(!board.as_array().unwrap().contains(&legacy_message));
+    let nested = workspace.join(".openraid/openraid.sqlite3");
+    assert!(nested.is_file());
+    for (name, contents) in legacy_files {
+        assert_eq!(
+            std::fs::read(workspace.join(name)).ok(),
+            contents,
+            "default commands changed legacy file {name}"
+        );
+    }
+    let explicit_legacy_board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--limit", "500", "--database"])
+            .arg(&legacy)
+            .output()
+            .unwrap(),
+    );
+    assert!(explicit_legacy_board
+        .as_array()
+        .unwrap()
+        .contains(&legacy_message));
+    assert!(!explicit_legacy_board
+        .as_array()
+        .unwrap()
+        .contains(&injected));
     let sessions = successful_json(
         isolated_workspace_command(workspace)
             .args(["sessions", "--json"])
             .output()
             .unwrap(),
     );
-    assert_eq!(sessions.as_array().unwrap().len(), 1);
-    assert_eq!(
-        std::path::PathBuf::from(sessions[0]["database"].as_str().unwrap()),
-        std::fs::canonicalize(legacy).unwrap()
-    );
+    let sessions = sessions.as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    for database in [legacy, nested] {
+        let database = std::fs::canonicalize(database).unwrap();
+        assert!(sessions.iter().any(|session| {
+            std::path::Path::new(session["database"].as_str().unwrap()) == database
+        }));
+    }
 }
 
 #[test]

@@ -47,6 +47,10 @@ pub mod snapshots;
 pub mod snowflake_oauth;
 #[path = "persistence/storage.rs"]
 pub mod storage;
+#[path = "terminal/theme.rs"]
+pub mod theme;
+#[path = "terminal/theme_preferences.rs"]
+pub mod theme_preferences;
 #[path = "workspace/tools.rs"]
 pub mod tools;
 #[path = "terminal/tui.rs"]

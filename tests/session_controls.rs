@@ -421,7 +421,7 @@ async fn pause_drains_inflight_protocol_group_and_resume_uses_preserved_history(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_drains_request_skips_unstarted_tools_and_leaves_console_reusable() -> Result<()> {
+async fn stop_cancels_request_without_response_and_leaves_console_reusable() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let config = Config {
@@ -441,17 +441,12 @@ async fn stop_drains_request_skips_unstarted_tools_and_leaves_console_reusable()
     let (mut first, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
     request(&mut first).await?;
     control.stop_work().await?;
-    assert!(control.is_stopping());
     assert!(
-        !run.is_finished(),
-        "stop must drain the admitted HTTP request"
+        control.is_stopping() || !control.is_busy(),
+        "stop is either cancelling workers or has already returned the console to idle"
     );
-    response(
-        &mut first,
-        "write_file",
-        json!({"path":"must-not-exist.txt","content":"unstarted side effect"}),
-    )
-    .await?;
+    // The provider intentionally never returns a completion. Stop must still
+    // finish the round, close this request, and leave the console reusable.
     wait_for_board(&store, "all workers drained; work stopped").await?;
     tokio::time::timeout(Duration::from_secs(5), async {
         while control.is_busy() {
@@ -459,7 +454,12 @@ async fn stop_drains_request_skips_unstarted_tools_and_leaves_console_reusable()
         }
     })
     .await?;
-    assert!(!directory.path().join("must-not-exist.txt").exists());
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), first.read(&mut byte)).await??,
+        0,
+        "stop cancels the admitted HTTP request instead of waiting for its response"
+    );
     assert!(!run.is_finished());
     assert!(
         store.unfinished_prompt().await?.is_none(),
@@ -473,13 +473,6 @@ async fn stop_drains_request_skips_unstarted_tools_and_leaves_console_reusable()
             .any(|entry| entry.body.contains("completion consensus reached")),
         "stop cannot claim successful consensus"
     );
-    let checkpoint = store.load_checkpoint("agent-001").await?.unwrap();
-    assert!(checkpoint["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|message| message["role"] == "tool"
-            && message["content"].as_str().unwrap().contains("skipped")));
     control.post_prompt("new task after stop".into()).await?;
     let (mut second, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
     request(&mut second).await?;

@@ -2,7 +2,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
-    style::{Color, Modifier},
+    style::Modifier,
     text::Span,
 };
 
@@ -60,13 +60,14 @@ impl Selection {
         if buffer.area != drag.buffer.area {
             return;
         }
+        let palette = crate::theme::current_palette();
         for y in drag.area.y..drag.area.bottom() {
             for x in drag.area.x..drag.area.right() {
                 buffer[(x, y)] = drag.buffer[(x, y)].clone();
                 if drag.moved && drag.contains(x, y) {
                     buffer[(x, y)]
-                        .set_bg(Color::Rgb(65, 85, 125))
-                        .set_fg(Color::White)
+                        .set_bg(palette.selection)
+                        .set_fg(palette.selection_text)
                         .set_style(Modifier::BOLD);
                 }
             }

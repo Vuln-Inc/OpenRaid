@@ -1,4 +1,7 @@
 //! A live operator console. Board navigation is exclusively global cursor pagination.
+#[cfg(test)]
+#[path = "inspection_tests.rs"]
+mod inspection_tests;
 #[path = "selection.rs"]
 mod selection;
 use crate::{
@@ -40,13 +43,6 @@ use tokio::sync::watch;
 const PAGE_SIZE: usize = 100;
 #[path = "tps.rs"]
 mod tps;
-const SLATE: Color = Color::Rgb(21, 38, 56);
-const ICE: Color = Color::Rgb(220, 231, 239);
-const COBALT: Color = Color::Rgb(168, 184, 255);
-const SEA: Color = Color::Rgb(121, 201, 187);
-const AMBER: Color = Color::Rgb(232, 186, 120);
-const ROSE: Color = Color::Rgb(232, 135, 152);
-const MUTED: Color = Color::Rgb(143, 163, 184);
 
 #[derive(Clone, Default)]
 pub struct SessionInfo {
@@ -56,12 +52,13 @@ pub struct SessionInfo {
     pub objective: String,
 }
 
-const COMMANDS: [(&str, &str, KeyCode); 21] = [
+const COMMANDS: [(&str, &str, KeyCode); 23] = [
     ("Send an owner instruction", "o", KeyCode::Char('o')),
     ("Toggle live following", "f", KeyCode::Char('f')),
     ("Focus the shared board", "1", KeyCode::Char('1')),
     ("Focus the agent roster", "2", KeyCode::Char('2')),
     ("Focus the selected agent stream", "3", KeyCode::Char('3')),
+    ("Inspect selected agent activity", "Enter", KeyCode::Enter),
     ("Show all keyboard controls", "?", KeyCode::Char('h')),
     ("Close / detach the console", "q", KeyCode::Char('q')),
     (
@@ -70,6 +67,11 @@ const COMMANDS: [(&str, &str, KeyCode); 21] = [
         KeyCode::F(2),
     ),
     ("Connect a provider", "Ctrl+X C · /connect", KeyCode::F(3)),
+    (
+        "Choose a color theme",
+        "Ctrl+X Y · /themes",
+        KeyCode::Char('y'),
+    ),
     (
         "Choose thinking variant",
         "Ctrl+X T · /variant",
@@ -125,6 +127,10 @@ struct UiState {
     board_scroll: u16,
     detail_scroll: u16,
     detail_follow: bool,
+    inspecting: bool,
+    inspection_scroll: usize,
+    inspection_follow: bool,
+    inspection_page_size: usize,
     follow: bool,
     composing: bool,
     draft: String,
@@ -174,6 +180,10 @@ impl Default for UiState {
             board_scroll: 0,
             detail_scroll: 0,
             detail_follow: true,
+            inspecting: false,
+            inspection_scroll: 0,
+            inspection_follow: true,
+            inspection_page_size: 1,
             follow: true,
             composing: false,
             draft: String::new(),
@@ -259,6 +269,7 @@ impl UiState {
             match key.code {
                 KeyCode::Char('m') => self.actions.push_back(Action::Models),
                 KeyCode::Char('c') => self.actions.push_back(Action::Connect),
+                KeyCode::Char('y') => self.actions.push_back(Action::Themes),
                 KeyCode::Char('t') => self.actions.push_back(Action::Variants),
                 KeyCode::Char('j') => self.actions.push_back(Action::JumpList),
                 KeyCode::Char('a') => self.actions.push_back(Action::Grid),
@@ -289,7 +300,7 @@ impl UiState {
                 self.menu_epoch += 1;
                 self.leader = true;
                 self.notice =
-                    "Ctrl+X: S sessions · N new · P pause · R resume · X stop · M models · +/- agents".into();
+                    "Ctrl+X: S sessions · N new · P pause · R resume · X stop · M models · Y themes · +/- agents".into();
                 return Ok(false);
             }
             if key.code == KeyCode::Char('t') {
@@ -412,6 +423,11 @@ impl UiState {
                 KeyCode::Enter => {
                     self.palette = false;
                     key.code = COMMANDS[self.palette_selected].2;
+                    if key.code == KeyCode::Enter {
+                        self.palette_editing = false;
+                        self.open_inspection(agent_count);
+                        return Ok(false);
+                    }
                 }
                 _ => {}
             }
@@ -423,12 +439,50 @@ impl UiState {
                 return Ok(false);
             }
         }
+        if self.inspecting {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    self.close_inspection();
+                    return Ok(false);
+                }
+                KeyCode::Up | KeyCode::Char('k') => self.scroll_inspection(-3),
+                KeyCode::Down | KeyCode::Char('j') => self.scroll_inspection(3),
+                KeyCode::PageUp => self.scroll_inspection(-(self.inspection_page_size as i64)),
+                KeyCode::PageDown => self.scroll_inspection(self.inspection_page_size as i64),
+                KeyCode::Home => {
+                    self.inspection_follow = false;
+                    self.inspection_scroll = 0;
+                }
+                KeyCode::End => self.inspection_follow = true,
+                KeyCode::Char('f') => self.inspection_follow = !self.inspection_follow,
+                KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('1' | '2' | '3') => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+            if matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Char('j' | 'k' | 'f')
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            ) {
+                return Ok(false);
+            }
+        }
         match key.code {
             KeyCode::F(2) => self.actions.push_back(Action::Models),
             KeyCode::F(3) => self.actions.push_back(Action::Connect),
             KeyCode::F(4) => self.actions.push_back(Action::Variants),
             KeyCode::F(5) => self.actions.push_back(Action::JumpList),
-            KeyCode::F(6) => self.grid = !self.grid,
+            KeyCode::F(6) => {
+                self.close_inspection();
+                self.grid = !self.grid;
+                self.focus = Focus::Agents;
+            }
             KeyCode::F(7) => self.actions.push_back(Action::Members),
             KeyCode::F(8) => self.actions.push_back(Action::AddList),
             KeyCode::F(9) => self.actions.push_back(Action::RemoveList),
@@ -437,6 +491,7 @@ impl UiState {
             KeyCode::F(12) => self.actions.push_back(Action::Stop),
             KeyCode::Char('p') => self.actions.push_back(Action::Pause),
             KeyCode::Char('r') => self.actions.push_back(Action::Resume),
+            KeyCode::Char('y') => self.actions.push_back(Action::Themes),
             KeyCode::Char('/') => self.menu = Some(Menu::commands()),
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
@@ -524,15 +579,10 @@ impl UiState {
             KeyCode::Down | KeyCode::Char('j') => self.navigate(1, agent_count),
             KeyCode::Up | KeyCode::Char('k') => self.navigate(-1, agent_count),
             KeyCode::Enter => {
-                if self.grid {
-                    self.grid = false;
-                    self.focus = Focus::Detail;
-                    return Ok(false);
-                }
-                self.focus = if self.focus == Focus::Agents {
-                    Focus::Detail
+                if self.grid || self.focus != Focus::Board {
+                    self.open_inspection(agent_count);
                 } else {
-                    Focus::Agents
+                    self.focus = Focus::Agents;
                 }
             }
             _ => {}
@@ -545,6 +595,10 @@ impl UiState {
     }
 
     fn navigate(&mut self, delta: i32, agents: usize) {
+        if self.inspecting {
+            self.scroll_inspection(i64::from(delta) * 3);
+            return;
+        }
         match self.focus {
             Focus::Agents => {
                 self.selected = if delta > 0 {
@@ -573,6 +627,33 @@ impl UiState {
                 }
             }
         }
+    }
+
+    fn open_inspection(&mut self, agent_count: usize) {
+        if agent_count == 0 {
+            self.notice = "No agents to inspect. Add agents with /add.".into();
+            return;
+        }
+        self.selected = self.selected.min(agent_count - 1);
+        self.inspecting = true;
+        self.inspection_scroll = 0;
+        self.inspection_follow = true;
+        self.selection.cancel();
+    }
+
+    fn close_inspection(&mut self) {
+        self.inspecting = false;
+        self.selection.cancel();
+    }
+
+    fn scroll_inspection(&mut self, delta: i64) {
+        self.inspection_follow = false;
+        self.inspection_scroll = if delta < 0 {
+            self.inspection_scroll
+                .saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            self.inspection_scroll.saturating_add(delta as usize)
+        };
     }
 }
 
@@ -849,7 +930,8 @@ async fn perform(action: Action, manager: ProviderManager, store: Store) -> Resu
         Action::Stop => {
             manager.control.stop_work().await?;
             Ok(JobResult::LifecycleChanged(
-                "Stopping current work. In-flight operations drain before returning idle.".into(),
+                "Stopped current work. Active agent requests, tools and processes are cancelled."
+                    .into(),
             ))
         }
         Action::Members | Action::RemoveList => {
@@ -964,6 +1046,40 @@ async fn perform(action: Action, manager: ProviderManager, store: Store) -> Resu
         }
         Action::Jump(seq) => Ok(JobResult::Jumped(seq)),
         _ => anyhow::bail!("unsupported background action"),
+    }
+}
+
+/// Local appearance changes remain available even while remote work is pending.
+fn dispatch_theme_actions(app: &mut UiState) {
+    while let Some(index) = app
+        .actions
+        .iter()
+        .position(|action| matches!(action, Action::Themes | Action::SelectTheme(_)))
+    {
+        match app.actions.remove(index).unwrap() {
+            Action::Themes => {
+                app.menu_epoch += 1;
+                app.menu = Some(Menu::themes(crate::theme::current_theme().id));
+                app.notice.clear();
+            }
+            Action::SelectTheme(id) => {
+                let Some(theme) = crate::theme::find_theme(&id) else {
+                    app.notice =
+                        format!("Unknown theme: {id}. Open /themes to choose a built-in theme.");
+                    continue;
+                };
+                crate::theme::set_theme(theme.id);
+                app.selection.cancel();
+                app.notice = match crate::theme_preferences::save(theme.id) {
+                    Ok(()) => format!("{} theme applied and saved", theme.name),
+                    Err(error) => format!(
+                        "{} theme applied for this session; could not save preference: {error:#}",
+                        theme.name
+                    ),
+                };
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -1200,6 +1316,7 @@ async fn run_console(
                         board_dirty = true;
                     },
                     Ok(Ok(JobResult::Jumped(seq))) => {
+                        app.close_inspection();
                         app.after = seq.saturating_sub(1); app.follow = false; app.board_scroll = 0; app.focus = Focus::Board; app.grid = false;
                         app.load(&store).await?; app.notice = format!("Jumped to prompt #{seq}; click it for copy/restore");
                     },
@@ -1261,9 +1378,9 @@ async fn run_console(
                             ], None));
                             continue;
                         }
-                        if let Some((_,index)) = app.grid_hits.iter().find(|(rect,_)| rect.contains((mouse.column,mouse.row).into())) { app.selected = *index; app.grid = false; app.focus = Focus::Detail; continue; }
+                        if let Some((_,index)) = app.grid_hits.iter().find(|(rect,_)| rect.contains((mouse.column,mouse.row).into())) { app.selected = *index; app.open_inspection(agent_count); continue; }
                     }
-                    for (index, rect) in app.panels.iter().enumerate() {
+                    for (index, rect) in app.panels.iter().enumerate().filter(|_| !app.inspecting) {
                         if rect.contains((mouse.column, mouse.row).into()) {
                             app.focus = [Focus::Board, Focus::Agents, Focus::Detail][index];
                             break;
@@ -1285,12 +1402,14 @@ async fn run_console(
             }
         }
         let primary_mutation_pending = job.as_ref().is_some_and(|(_, _, read_only, _)| !read_only);
+        dispatch_theme_actions(&mut app);
         dispatch_roster_actions(&mut app, manager.as_ref(), &store, &mut roster_jobs, primary_mutation_pending).await?;
         cancel_stale_menu_job(app.menu_epoch, &mut job);
         if job.is_none() {
             if let Some(action) = app.actions.pop_front() {
                 match action {
                     Action::Grid => {
+                        app.close_inspection();
                         app.grid = !app.grid;
                         app.focus = Focus::Agents;
                         app.composing = false;
@@ -1399,28 +1518,51 @@ fn open_terminal() -> Result<(TerminalGuard, Terminal<CrosstermBackend<Stdout>>)
 }
 
 fn block(title: impl Into<String>, focused: bool) -> Block<'static> {
+    let palette = crate::theme::current_theme().palette;
     Block::new()
         .borders(Borders::ALL)
         .title(title.into())
-        .border_style(Style::default().fg(if focused { COBALT } else { MUTED }))
+        .border_style(Style::default().fg(if focused {
+            palette.accent
+        } else {
+            palette.border
+        }))
 }
 
 fn status_color(status: AgentStatus) -> Color {
+    let palette = crate::theme::current_theme().palette;
     match status {
-        AgentStatus::Thinking | AgentStatus::Tool => COBALT,
-        AgentStatus::Retry => AMBER,
-        AgentStatus::Error => ROSE,
-        AgentStatus::Voted | AgentStatus::Finished => SEA,
-        _ => MUTED,
+        AgentStatus::Thinking | AgentStatus::Tool => palette.accent,
+        AgentStatus::Retry => palette.warning,
+        AgentStatus::Error => palette.error,
+        AgentStatus::Voted | AgentStatus::Finished => palette.success,
+        _ => palette.muted,
     }
 }
 
 fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, metrics: &Metrics) {
+    let palette = crate::theme::current_theme().palette;
     let area = frame.area();
     frame.render_widget(
-        Block::default().style(Style::default().bg(SLATE).fg(ICE)),
+        Block::default().style(Style::default().bg(palette.background).fg(palette.text)),
         area,
     );
+    if app.inspecting {
+        draw_inspection(frame, app, snapshot, metrics);
+        if app.composing {
+            draw_composer(frame, app);
+        }
+        if app.help {
+            draw_help(frame);
+        }
+        if app.palette {
+            draw_palette(frame, app);
+        }
+        if let Some(menu) = &app.menu {
+            menu.draw(frame);
+        }
+        return;
+    }
     let rows = Layout::vertical([
         Constraint::Length(if area.height >= 24 {
             if app.managed {
@@ -1449,7 +1591,9 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
             } else {
                 " openraid  "
             },
-            Style::default().fg(SEA).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(palette.success)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             if app.managed {
@@ -1467,15 +1611,15 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
             },
             Style::default()
                 .fg(if app.paused || app.stopping {
-                    AMBER
+                    palette.warning
                 } else {
-                    SEA
+                    palette.success
                 })
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{members} agents  {} draining  ", app.draining_count),
-            Style::default().fg(COBALT),
+            Style::default().fg(palette.accent),
         ),
         Span::raw(format!(
             "{} active  {} done votes / {} required  ",
@@ -1485,7 +1629,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
         )),
         Span::styled(
             format!("{:.1} tps (1m)  ", app.tps),
-            Style::default().fg(AMBER),
+            Style::default().fg(palette.warning),
         ),
         Span::raw(format!(
             "{:02}:{:02}:{:02}",
@@ -1507,13 +1651,13 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                     &app.session.variant
                 }
             ),
-            Style::default().fg(COBALT),
+            Style::default().fg(palette.accent),
         ),
     ];
     if app.managed {
         header.push(Line::styled(
             format!(" cwd: {}", app.workspace),
-            Style::default().fg(ICE),
+            Style::default().fg(palette.text),
         ));
         header.push(Line::styled(
             format!(
@@ -1526,7 +1670,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                 },
                 app.database
             ),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette.muted),
         ));
     }
     if area.height >= 24 {
@@ -1539,7 +1683,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                     .next()
                     .unwrap_or("Collaborate on the shared workspace")
             ),
-            Style::default().fg(ICE),
+            Style::default().fg(palette.text),
         ));
         header.push(Line::styled(
             format!(
@@ -1551,7 +1695,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                 snapshot.retries,
                 snapshot.finished
             ),
-            Style::default().fg(MUTED),
+            Style::default().fg(palette.muted),
         ));
     }
     frame.render_widget(Paragraph::new(header), rows[0]);
@@ -1563,8 +1707,12 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                 Focus::Agents => 1,
                 Focus::Detail => 2,
             })
-            .style(Style::default().fg(MUTED))
-            .highlight_style(Style::default().fg(SEA).add_modifier(Modifier::BOLD))
+            .style(Style::default().fg(palette.muted))
+            .highlight_style(
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
             .divider("  "),
         rows[1],
     );
@@ -1622,7 +1770,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                 .wrap(Wrap { trim: false })
                 .block(block(
                     if app.stopping {
-                        " Prompt · stopping · wait for in-flight operations to drain "
+                        " Prompt · stopping · cancelling active operations immediately "
                     } else if app.paused {
                         " Prompt · paused · /resume continues · /stop ends work "
                     } else if app.busy {
@@ -1638,7 +1786,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
         frame.render_widget(
             Sparkline::default()
                 .data(&rates)
-                .style(Style::default().fg(COBALT))
+                .style(Style::default().fg(palette.accent))
                 .block(block(
                     format!(" output tokens / second (1m avg)  {:.1}", app.tps),
                     false,
@@ -1658,10 +1806,10 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                " / commands · Ctrl+X S sessions · P pause · R resume · X stop · Esc then q detach",
-                Style::default().fg(SEA),
+                " Enter inspect agent · / commands · /themes appearance · Ctrl+X P/R/X pause/resume/stop",
+                Style::default().fg(palette.success),
             ),
-            Line::styled(app.notice.clone(), Style::default().fg(AMBER)),
+            Line::styled(app.notice.clone(), Style::default().fg(palette.warning)),
         ]),
         footer,
     );
@@ -1680,6 +1828,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
 }
 
 fn draw_session_controls(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
+    let palette = crate::theme::current_theme().palette;
     let controls = [
         (" Sessions ", Action::Sessions),
         (" New ", Action::NewSession),
@@ -1706,8 +1855,8 @@ fn draw_session_controls(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
         spans.push(Span::styled(
             label,
             Style::default()
-                .fg(SEA)
-                .bg(Color::Rgb(45, 66, 96))
+                .fg(palette.selection_text)
+                .bg(palette.selection)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::raw(" "));
@@ -1723,6 +1872,7 @@ fn draw_grid(
     snapshot: &MetricsSnapshot,
     metrics: &Metrics,
 ) {
+    let palette = crate::theme::current_theme().palette;
     let count = snapshot.agents.len().max(1);
     let columns = ((count as f64).sqrt().ceil() as usize)
         .min(6)
@@ -1763,14 +1913,14 @@ fn draw_grid(
                         ),
                         Style::default().fg(status_color(agent.status)),
                     ),
-                    Line::styled(detail, Style::default().fg(AMBER)),
+                    Line::styled(detail, Style::default().fg(palette.warning)),
                     Line::raw(output),
                 ];
                 frame.render_widget(
                     Paragraph::new(lines)
                         .wrap(Wrap { trim: false })
                         .block(block(
-                            format!(" {} · click for stream ", agent.id),
+                            format!(" {} · Enter/click inspect ", agent.id),
                             index == app.selected,
                         )),
                     *cell,
@@ -1782,6 +1932,7 @@ fn draw_grid(
 }
 
 fn draw_board(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
+    let palette = crate::theme::current_theme().palette;
     let first = app.board.first().map(|m| m.seq).unwrap_or(0);
     let last = app.board.last().map(|m| m.seq).unwrap_or(0);
     let title = format!(
@@ -1802,7 +1953,11 @@ fn draw_board(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
         lines.push(Line::styled(
             format!("#{}  [{}]", message.seq, role),
             Style::default()
-                .fg(if message.owner { AMBER } else { COBALT })
+                .fg(if message.owner {
+                    palette.warning
+                } else {
+                    palette.accent
+                })
                 .add_modifier(Modifier::BOLD),
         ));
         for line in message.body.lines() {
@@ -1820,7 +1975,7 @@ fn draw_board(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
     if lines.is_empty() {
         lines.push(Line::styled(
             "the board is empty. press o to send the swarm an owner instruction.",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette.muted),
         ));
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -1859,6 +2014,7 @@ fn draw_board(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
 }
 
 fn draw_agents(frame: &mut Frame<'_>, area: Rect, app: &mut UiState, snapshot: &MetricsSnapshot) {
+    let palette = crate::theme::current_theme().palette;
     let rows = snapshot.agents.iter().map(|agent| {
         Row::new(vec![
             Cell::from(agent.id.clone()),
@@ -1879,7 +2035,8 @@ fn draw_agents(frame: &mut Frame<'_>, area: Rect, app: &mut UiState, snapshot: &
         ],
     )
     .header(
-        Row::new(["agent", "state", "out tok", "tools", "retry"]).style(Style::default().fg(MUTED)),
+        Row::new(["agent", "state", "out tok", "tools", "retry"])
+            .style(Style::default().fg(palette.muted)),
     )
     .block(block(
         " agents  enter drills into selected agent",
@@ -1887,7 +2044,8 @@ fn draw_agents(frame: &mut Frame<'_>, area: Rect, app: &mut UiState, snapshot: &
     ))
     .row_highlight_style(
         Style::default()
-            .bg(Color::Rgb(45, 66, 96))
+            .bg(palette.selection)
+            .fg(palette.selection_text)
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("> ");
@@ -1901,6 +2059,7 @@ fn draw_detail(
     snapshot: &MetricsSnapshot,
     metrics: &Metrics,
 ) {
+    let palette = crate::theme::current_theme().palette;
     let Some(agent) = snapshot.agents.get(app.selected) else {
         return;
     };
@@ -1915,13 +2074,13 @@ fn draw_detail(
             "input {}  output {}  cached {}",
             agent.input_tokens, agent.output_tokens, agent.cached_tokens
         )),
-        Line::styled(detail, Style::default().fg(AMBER)),
+        Line::styled(detail, Style::default().fg(palette.warning)),
         Line::raw(""),
     ];
     if output.is_empty() {
         lines.push(Line::styled(
             "waiting for streaming output",
-            Style::default().fg(MUTED),
+            Style::default().fg(palette.muted),
         ));
     } else {
         for line in output.lines() {
@@ -1940,10 +2099,145 @@ fn draw_detail(
     };
     frame.render_widget(
         paragraph.scroll((app.detail_scroll, 0)).block(block(
-            " agent detail  live stream preview (last 16 KiB)",
+            " stream preview (last 16 KiB) · Enter full activity ",
             app.focus == Focus::Detail,
         )),
         area,
+    );
+}
+
+/// A dedicated reading surface keeps dashboard pagination and selection intact.
+fn draw_inspection(
+    frame: &mut Frame<'_>,
+    app: &mut UiState,
+    snapshot: &MetricsSnapshot,
+    metrics: &Metrics,
+) {
+    let palette = crate::theme::current_theme().palette;
+    let rows = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(2),
+    ])
+    .split(frame.area());
+    app.panels = [Rect::default(), Rect::default(), rows[1]];
+    app.grid_hits.clear();
+    app.prompt_hits.clear();
+    app.control_hits.clear();
+    app.inspection_page_size = usize::from(rows[1].height.saturating_sub(2)).max(1);
+    let Some(agent) = snapshot.agents.get(app.selected) else {
+        frame.render_widget(
+            Paragraph::new("No agent activity is available. Esc returns to the dashboard.")
+                .wrap(Wrap { trim: false })
+                .block(block(" Agent inspection ", true)),
+            rows[1],
+        );
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(" {} — {}", agent.id, agent.status.label()),
+                Style::default()
+                    .fg(status_color(agent.status))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(format!(
+                " input {}  output {}  cached {}  tools {}  retries {}",
+                agent.input_tokens,
+                agent.output_tokens,
+                agent.cached_tokens,
+                agent.tools,
+                agent.retries
+            )),
+            Line::styled(
+                metrics.agent_detail(&agent.id),
+                Style::default().fg(palette.warning),
+            ),
+        ]),
+        rows[0],
+    );
+    let activity = metrics.agent_activity(&agent.id);
+    let lines = if activity.is_empty() {
+        vec![Line::styled(
+            "Waiting for activity. Generation, tool executions and process output appear here.",
+            Style::default().fg(palette.muted),
+        )]
+    } else {
+        // Split exceptionally long physical lines into safe rendering segments.
+        // This also permits histories beyond Paragraph's u16 scroll range.
+        activity
+            .lines()
+            .flat_map(|line| {
+                let mut rest = line;
+                let mut segments = Vec::new();
+                while rest.len() > 8192 {
+                    let mut end = 8192;
+                    while !rest.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    segments.push(Line::raw(rest[..end].to_owned()));
+                    rest = &rest[end..];
+                }
+                segments.push(Line::raw(rest.to_owned()));
+                segments
+            })
+            .collect()
+    };
+    let width = rows[1].width.saturating_sub(2).max(1);
+    let line_heights: Vec<usize> = lines
+        .iter()
+        .map(|line| {
+            Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+        })
+        .collect();
+    let total_lines: usize = line_heights.iter().sum();
+    let last_scroll = total_lines.saturating_sub(app.inspection_page_size);
+    app.inspection_scroll = if app.inspection_follow {
+        last_scroll
+    } else {
+        app.inspection_scroll.min(last_scroll)
+    };
+    // Discard offscreen physical lines before using Paragraph::scroll. The
+    // residual is bounded by one segment, so no history wraps at 65,535 rows.
+    let mut remaining = app.inspection_scroll;
+    let mut first = 0;
+    while first < line_heights.len() && remaining >= line_heights[first] {
+        remaining -= line_heights[first];
+        first += 1;
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((remaining as u16, 0))
+            .block(block(
+                format!(
+                    " {} activity · {} · lines {}–{} / {} ",
+                    agent.id,
+                    if app.inspection_follow {
+                        "following"
+                    } else {
+                        "history"
+                    },
+                    app.inspection_scroll + 1,
+                    (app.inspection_scroll + app.inspection_page_size).min(total_lines),
+                    total_lines
+                ),
+                true,
+            )),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                " Esc/q dashboard · ↑/↓ scroll · PgUp/PgDn page · Home/End first/latest · f follow",
+                Style::default().fg(palette.success),
+            ),
+            Line::styled(app.notice.clone(), Style::default().fg(palette.warning)),
+        ]),
+        rows[2],
     );
 }
 
@@ -1959,6 +2253,7 @@ fn popup(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_composer(frame: &mut Frame<'_>, app: &UiState) {
+    let palette = crate::theme::current_theme().palette;
     let area = popup(frame.area(), 84, 10);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1967,7 +2262,7 @@ fn draw_composer(frame: &mut Frame<'_>, app: &UiState) {
             app.draft
         ))
         .wrap(Wrap { trim: false })
-        .style(Style::default().bg(SLATE).fg(ICE))
+        .style(Style::default().bg(palette.surface).fg(palette.text))
         .block(block(
             " owner instruction  committing revokes done votes",
             true,
@@ -1977,6 +2272,7 @@ fn draw_composer(frame: &mut Frame<'_>, app: &UiState) {
 }
 
 fn draw_help(frame: &mut Frame<'_>) {
+    let palette = crate::theme::current_theme().palette;
     let area = popup(frame.area(), 104, 38);
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1986,26 +2282,30 @@ fn draw_help(frame: &mut Frame<'_>) {
          /start [prompt]   start an objective, or focus the prompt editor\n\
          /pause            pause at safe operation boundaries; current operations finish\n\
          /resume           continue paused work with the same context\n\
-         /stop             drain current work and return idle; no completion vote required\n\
+         /stop             cancel agents, requests, tools and processes immediately\n\
          Ctrl+X S/N        workspace sessions / new session\n\
          Ctrl+X P/R/X      pause / resume / stop, even while editing a prompt\n\
          /models (/model)   choose from connected providers only\n\
          /connect          add or replace a provider key\n\
-         /variant          thinking menu; Ctrl+T cycles variants\n\
+          /variant          thinking menu; Ctrl+T cycles variants\n\
+          /themes [theme-id] preview themes or apply a theme directly\n\
          /jump             search every sent prompt\n\
-         /agents           tiled agent streams; click a tile to drill in\n\
+         /agents           tiled agent streams; Enter/click opens full activity\n\
          /members          manage the current parallel-agent roster\n\
          /add [count]      add collaborators to ongoing work (default 1)\n\
          /remove [IDs]     remove a batch, or open the graceful-remove menu\n\
          Ctrl+X then M/C/T models / connect / variants (no time limit)\n\
-         Ctrl+X then J/A   prompt history / agent grid\n\
+          Ctrl+X then J/A   prompt history / agent grid\n\
+          Ctrl+X then Y     theme picker with live palette previews\n\
          Ctrl+X then +/-   choose add count / mark agents to remove\n\
          click a prompt    copy / restore prompt and workspace / jump\n\
          drag text         copy selection immediately on release\n\
          Ctrl+P            command palette; Esc closes overlays\n\
          Tab / Shift+Tab   focus board / agents / stream\n\
          ↑/↓ or j/k        navigate focused panel\n\
-         PgUp/PgDn         board pages, or agent-grid pages\n\
+         Enter             inspect selected agent generation/tools/process output\n\
+         Esc / Q           return from inspection to the same dashboard/grid\n\
+         PgUp/PgDn         board/grid pages, or activity pages in inspection\n\
          Home/End, F       first/latest and follow\n\
          O                 focus prompt editor; Enter submits\n\
          ? / H / F1        help\n\
@@ -2015,7 +2315,7 @@ fn draw_help(frame: &mut Frame<'_>) {
          Restore uses pre-prompt Git snapshots when available and runs only idle.",
         )
         .wrap(Wrap { trim: false })
-        .style(Style::default().bg(SLATE).fg(ICE))
+        .style(Style::default().bg(palette.surface).fg(palette.text))
         .block(block(
             " Help · openraid by vuln.industries · Esc closes ",
             true,
@@ -2025,6 +2325,7 @@ fn draw_help(frame: &mut Frame<'_>) {
 }
 
 fn draw_palette(frame: &mut Frame<'_>, app: &UiState) {
+    let palette = crate::theme::current_theme().palette;
     let area = popup(frame.area(), 72, 12);
     frame.render_widget(Clear, area);
     let items = COMMANDS
@@ -2033,12 +2334,16 @@ fn draw_palette(frame: &mut Frame<'_>, app: &UiState) {
     let mut selected = ListState::default().with_selected(Some(app.palette_selected));
     frame.render_stateful_widget(
         List::new(items)
-            .style(Style::default().bg(SLATE).fg(ICE))
+            .style(Style::default().bg(palette.surface).fg(palette.text))
             .block(block(
                 " Commands · ↑/↓ choose · Enter run · Esc close ",
                 true,
             ))
-            .highlight_style(Style::default().bg(Color::Rgb(48, 66, 87)).fg(SEA))
+            .highlight_style(
+                Style::default()
+                    .bg(palette.selection)
+                    .fg(palette.selection_text),
+            )
             .highlight_symbol("› "),
         area,
         &mut selected,
@@ -2048,6 +2353,74 @@ fn draw_palette(frame: &mut Frame<'_>, app: &UiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_picker_bypasses_remote_actions_in_unmanaged_console() {
+        let mut app = UiState::default();
+        app.actions.push_back(Action::Models);
+        app.actions.push_back(Action::Themes);
+        app.actions.push_back(Action::Connect);
+
+        dispatch_theme_actions(&mut app);
+
+        assert!(matches!(
+            app.menu.as_ref().map(|menu| &menu.kind),
+            Some(Kind::Themes)
+        ));
+        assert_eq!(app.menu_epoch, 1);
+        assert_eq!(app.actions.len(), 2);
+        assert!(matches!(app.actions.front(), Some(Action::Models)));
+        assert!(matches!(app.actions.back(), Some(Action::Connect)));
+    }
+
+    #[test]
+    fn invalid_theme_selection_keeps_active_palette_and_pending_work() {
+        let active = crate::theme::current_theme().id;
+        let mut app = UiState::default();
+        app.actions
+            .push_back(Action::SelectTheme("does-not-exist".into()));
+        app.actions
+            .push_back(Action::Submit("ongoing objective".into()));
+
+        dispatch_theme_actions(&mut app);
+
+        assert_eq!(crate::theme::current_theme().id, active);
+        assert!(app.notice.contains("Unknown theme"));
+        assert!(app.notice.contains("/themes"));
+        assert!(matches!(app.actions.front(), Some(Action::Submit(_))));
+    }
+
+    #[tokio::test]
+    async fn theme_shortcut_preserves_composer_draft() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(directory.path().join("theme-shortcut.sqlite")).await?;
+        let mut app = UiState {
+            composing: true,
+            draft: "keep my objective".into(),
+            ..UiState::default()
+        };
+        app.key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &store,
+            1,
+        )
+        .await?;
+        app.key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &store,
+            1,
+        )
+        .await?;
+        dispatch_theme_actions(&mut app);
+
+        assert_eq!(app.draft, "keep my objective");
+        assert!(app.composing);
+        assert!(matches!(
+            app.menu.as_ref().map(|menu| &menu.kind),
+            Some(Kind::Themes)
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn lifecycle_shortcuts_work_inside_composer_and_do_not_post_commands() -> Result<()> {

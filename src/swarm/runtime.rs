@@ -114,7 +114,11 @@ impl Harness {
         }
         let workspace = WorkspaceTools::new(&config.workspace, config.max_processes)?;
         let mcp = crate::mcp::Hub::new(config.mcp.clone(), config.workspace.clone());
-        let tools = Arc::new(ToolBus::new(store.clone(), workspace).with_mcp(mcp.clone()));
+        let tools = Arc::new(
+            ToolBus::new(store.clone(), workspace.clone())
+                .with_mcp(mcp.clone())
+                .with_metrics(metrics.clone()),
+        );
         let provider = make_provider(&config)?;
         let (shutdown, _) = watch::channel(false);
         let control = SessionControl::new(
@@ -124,6 +128,7 @@ impl Harness {
             shutdown.clone(),
         )
         .with_mcp(mcp)
+        .with_workspace(workspace)
         .with_membership(membership);
         Ok(Self {
             store,
@@ -301,32 +306,38 @@ impl Harness {
         }
         let run_start_seq = if post_objective {
             let snapshot = if config.interactive_session {
-                crate::snapshots::capture(&config.workspace, &config.database)
-                    .await
-                    .ok()
+                tokio::select! {
+                    biased;
+                    _ = self.control.wait_for_work_stop() => None,
+                    snapshot = crate::snapshots::capture(&config.workspace, &config.database) => snapshot.ok(),
+                }
             } else {
                 None
             };
-            match self
-                .store
-                .owner_action(
-                    "owner",
-                    config.objective.clone(),
-                    self.shutdown.subscribe(),
-                    || {},
-                )
-                .await
-            {
-                Ok(message) => {
-                    if let Some(tree) = snapshot {
-                        self.store.save_snapshot(message.seq, tree).await?;
+            if self.control.work_was_stopped() {
+                self.control.drain_cursor()
+            } else {
+                match self
+                    .store
+                    .owner_action(
+                        "owner",
+                        config.objective.clone(),
+                        self.shutdown.subscribe(),
+                        || {},
+                    )
+                    .await
+                {
+                    Ok(message) => {
+                        if let Some(tree) = snapshot {
+                            self.store.save_snapshot(message.seq, tree).await?;
+                        }
+                        message.seq
                     }
-                    message.seq
+                    // Operator stop won the actor transaction before the initial
+                    // objective was admitted. There is no new task to dispatch.
+                    Err(_) if *self.shutdown.borrow() => self.control.drain_cursor(),
+                    Err(error) => return Err(error),
                 }
-                // Operator stop won the actor transaction before the initial
-                // objective was admitted. There is no new task to dispatch.
-                Err(_) if *self.shutdown.borrow() => self.control.drain_cursor(),
-                Err(error) => return Err(error),
             }
         } else {
             prompt_seq
@@ -371,6 +382,15 @@ impl Harness {
         let mut closing = self.control.stop_receiver();
         let mut round_stop = self.shutdown.subscribe();
         loop {
+            if self.control.work_was_stopped() && !*self.shutdown.borrow() {
+                // Workers have already cancelled. Wait only for the durable
+                // stop gate before publishing completion/clearing round slots.
+                round_stop
+                    .changed()
+                    .await
+                    .context("round control disconnected")?;
+                continue;
+            }
             if self.control.is_closing() && !*self.shutdown.borrow() {
                 self.control.drain_work(false).await?;
             }
@@ -499,10 +519,10 @@ impl Harness {
         self.store
             .append(
                 "harness",
-                if completed {
-                    "all workers drained; swarm complete"
-                } else if self.control.work_was_stopped() {
+                if self.control.work_was_stopped() {
                     "all workers drained; work stopped"
+                } else if completed {
+                    "all workers drained; swarm complete"
                 } else {
                     "all workers drained; session detached"
                 },
@@ -519,11 +539,19 @@ impl Harness {
             RunSummary {
                 agents: ordered_ids.len(),
                 finished_agents: finished,
-                votes: final_votes,
+                votes: if self.control.work_was_stopped() {
+                    0
+                } else {
+                    final_votes
+                },
                 board_messages: self.store.latest_seq().await?,
                 elapsed_ms: started.elapsed().as_millis(),
             },
-            owner_revision,
+            if self.control.work_was_stopped() {
+                self.control.drain_cursor()
+            } else {
+                owner_revision
+            },
         ))
     }
 
@@ -540,7 +568,7 @@ impl Harness {
         self.store.mark_worker_finished(&id).await?;
         self.control
             .publish_membership(self.store.membership().await?);
-        if *self.shutdown.borrow() || self.control.is_closing() {
+        if *self.shutdown.borrow() || self.control.is_closing() || self.control.work_was_stopped() {
             self.metrics.set_status(&id, AgentStatus::Finished);
             self.control.finish_draining(&id);
             return Ok(false);
@@ -623,12 +651,30 @@ async fn agent_worker(
     mut shutdown: WorkerStop,
     recovering: bool,
 ) -> Result<()> {
-    let result = if shutdown.requested() {
+    let mut interrupted = shared.control.work_stop_receiver();
+    let result = if shutdown.requested() || *interrupted.borrow() {
         Ok(())
-    } else if shared.config.mock {
-        mock_worker(&id, &shared, &mut shutdown).await
     } else {
-        live_worker(&id, &shared, &mut shutdown, recovering).await
+        // Drop the entire operation future on explicit /stop, including provider
+        // streaming, compaction, tool execution, and queued capacity waits.
+        // Consensus and member retirement still use safe dispatch boundaries.
+        tokio::select! {
+            biased;
+            _ = async {
+                while !*interrupted.borrow() {
+                    if interrupted.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => Ok(()),
+            result = async {
+                if shared.config.mock {
+                    mock_worker(&id, &shared, &mut shutdown).await
+                } else {
+                    live_worker(&id, &shared, &mut shutdown, recovering).await
+                }
+            } => result,
+        }
     };
     if !*shutdown.removed.borrow() {
         result?;
@@ -646,7 +692,7 @@ async fn agent_worker(
             if *shutdown.removed.borrow() {
                 "removed worker drained all in-flight operations; quitting gracefully"
             } else if shared.control.work_was_stopped() {
-                "worker drained all in-flight operations after owner stopped work"
+                "worker cancelled immediately after owner stopped work; inspect interrupted operations before resuming"
             } else if shared.control.is_closing() {
                 "worker drained all in-flight operations before session detach"
             } else {
@@ -936,6 +982,9 @@ async fn live_worker(
             shared.metrics.set_status(id, AgentStatus::Tool);
             shared.metrics.set_detail(id, &call.name);
             shared.metrics.record_tool(id);
+            shared
+                .metrics
+                .record_tool_start(id, &call.name, &call.arguments);
             // Freshness may change during streaming. ToolBus rejects stale mutation/vote calls;
             // defer new board history until all assistant/tool results are adjacent and complete.
             let args = serde_json::from_str::<Value>(&call.arguments);
@@ -952,6 +1001,9 @@ async fn live_worker(
                     Err(error) => json!({"error":format!("invalid tool JSON: {error}")}),
                 }
             };
+            shared
+                .metrics
+                .record_tool_result(id, &call.name, &output.to_string());
             context
                 .push(json!({"role":"tool","tool_call_id":call.id,"content":output.to_string()}));
             save_context(id, shared, &context, cursor).await?;

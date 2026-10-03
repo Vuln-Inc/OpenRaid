@@ -569,7 +569,8 @@ impl Store {
                   ),0), COALESCE((
                       SELECT MAX(stopped.seq) FROM board stopped
                       WHERE stopped.sender='owner-control'
-                        AND stopped.body='Owner stopped current work; draining in-flight operations.'
+                        AND stopped.body IN ('Owner stopped current work; draining in-flight operations.',
+                                             'Owner stopped current work; cancelling in-flight operations immediately.')
                         AND EXISTS(SELECT 1 FROM board drained
                             WHERE drained.sender='harness'
                               AND drained.body='all workers drained; work stopped'
@@ -577,7 +578,8 @@ impl Store {
                               AND NOT EXISTS(SELECT 1 FROM board later
                                   WHERE later.sender='owner-control'
                                     AND later.body IN ('Owner stopped current work; draining in-flight operations.',
-                                                       'Owner closed session; draining in-flight operations.')
+                                                        'Owner stopped current work; cancelling in-flight operations immediately.',
+                                                        'Owner closed session; draining in-flight operations.')
                                     AND later.seq > stopped.seq AND later.seq < drained.seq))
                   ),0)) ORDER BY seq DESC LIMIT 1",
                     [],
@@ -1230,7 +1232,7 @@ mod tests {
         let first = store.append("owner", "task stopped by owner", true).await?;
         store
             .drain_round(
-                "Owner stopped current work; draining in-flight operations.".into(),
+                "Owner stopped current work; cancelling in-flight operations immediately.".into(),
                 |_| {},
             )
             .await?;

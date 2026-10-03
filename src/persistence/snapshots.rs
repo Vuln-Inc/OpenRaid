@@ -9,9 +9,20 @@ use std::{
 use tokio::{io::AsyncWriteExt, process::Command};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
+struct SnapshotIndex(PathBuf);
+
+impl Drop for SnapshotIndex {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let mut lock = self.0.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(PathBuf::from(lock));
+    }
+}
+
 async fn git(root: &Path, index: Option<&Path>, args: &[&str]) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
-    command.current_dir(root).args(args);
+    command.current_dir(root).args(args).kill_on_drop(true);
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
         command.env(
@@ -35,6 +46,7 @@ async fn repository(root: &Path) -> Result<PathBuf> {
     tokio::fs::create_dir_all(&directory).await?;
     if !directory.join("HEAD").is_file() {
         let result = Command::new("git")
+            .kill_on_drop(true)
             .args(["init", "--bare", "--quiet"])
             .arg(&directory)
             .output()
@@ -67,6 +79,7 @@ pub async fn capture(root: &Path, database: &Path) -> Result<String> {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    let _index = SnapshotIndex(index.clone());
     let result = async {
         git(root, Some(&index), &["read-tree", "--empty"]).await?;
         let mut exclusions = vec![

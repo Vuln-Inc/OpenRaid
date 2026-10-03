@@ -257,20 +257,22 @@ export async function discoverGitLabModels(request, { load = name => import(name
     provider: { api: instanceUrl, npm: 'gitlab-ai-provider' }, options: { workflowRef: model.ref }, variants: {} }));
 }
 
-export async function run(request) {
+export async function run(request, abortSignal) {
+  abortSignal?.throwIfAborted();
   if (request.options?._openraid_sdk?.action === 'discover-models') {
     return { content: '', tool_calls: [], usage: { input_tokens: 0, output_tokens: 0, cached_tokens: 0 },
       finish_reason: 'stop', response_items: await discoverGitLabModels(request), native_content: null };
   }
   const { generateText, jsonSchema } = await import('ai');
   const { model, options, namespace } = await resolveSdkModel(request);
+  abortSignal?.throwIfAborted();
   const tools = Object.fromEntries((request.tools ?? []).map((entry) => [entry.function.name,
     { description: entry.function.description, inputSchema: jsonSchema(entry.function.parameters) }]));
   const generation = Object.fromEntries(['temperature', 'topP', 'topK', 'presencePenalty', 'frequencyPenalty', 'stopSequences', 'seed']
     .filter((key) => options[key] !== undefined).map((key) => [key, options[key]]));
   const result = await generateText({ ...generation, model, messages: messagesForSdk(request.messages),
     maxOutputTokens: request.maxOutputTokens, tools: Object.keys(tools).length ? tools : undefined,
-    providerOptions: { [namespace]: options }, maxRetries: 2 });
+    providerOptions: { [namespace]: options }, maxRetries: 2, abortSignal });
   const usage = result.totalUsage ?? result.usage;
   const assistant = result.response.messages.find((message) => message.role === 'assistant');
   return { content: result.text ?? '', tool_calls: result.toolCalls.map((call) => ({ id: call.toolCallId,
@@ -296,13 +298,21 @@ export function safeError(error) {
 async function serve() {
   const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
   const pending = new Set();
+  const controllers = new Map();
   for await (const line of lines) {
     if (!line.trim()) continue;
     let envelope;
     try { envelope = JSON.parse(line); } catch { process.exitCode = 1; break; }
+    if (envelope.cancel !== undefined) {
+      controllers.get(envelope.cancel)?.abort();
+      continue;
+    }
+    const controller = new AbortController();
+    controllers.set(envelope.id, controller);
     const task = (async () => {
-      try { process.stdout.write(`${JSON.stringify({ id: envelope.id, completion: await run(envelope.request) })}\n`); }
+      try { process.stdout.write(`${JSON.stringify({ id: envelope.id, completion: await run(envelope.request, controller.signal) })}\n`); }
       catch (error) { process.stdout.write(`${JSON.stringify({ id: envelope.id, error: safeError(error) })}\n`); }
+      finally { controllers.delete(envelope.id); }
     })();
     pending.add(task);
     task.finally(() => pending.delete(task));

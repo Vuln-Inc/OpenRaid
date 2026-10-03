@@ -117,6 +117,58 @@ test('one shared SDK sidecar multiplexes simultaneous requests by id', async () 
   }
 });
 
+test('SDK sidecar cancellation aborts a stalled request without stopping another agent', { timeout: 15_000 }, async (t) => {
+  const admitted = Promise.withResolvers();
+  const siblingAdmitted = Promise.withResolvers();
+  const cancelled = Promise.withResolvers();
+  const healthy = Promise.withResolvers();
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const request = JSON.parse(body);
+    if (request.model === 'stalled') {
+      res.once('close', () => cancelled.resolve());
+      admitted.resolve();
+      return; // Only caller cancellation can end this admitted request.
+    }
+    siblingAdmitted.resolve();
+    await cancelled.promise;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ id: 'chat-healthy', object: 'chat.completion', created: 1, model: request.model,
+      choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'still running' } }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const child = spawn(process.execPath, [fileURLToPath(new URL('sdk-bridge.mjs', import.meta.url)), '--server'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  child.once('error', (error) => { admitted.reject(error); siblingAdmitted.reject(error); healthy.reject(error); });
+  const lines = createInterface({ input: child.stdout });
+  lines.on('line', (line) => {
+    const result = JSON.parse(line);
+    if (result.id === 2) healthy.resolve(result);
+  });
+  // Teardown is registered before awaits so a failed cancellation cannot leak
+  // the bridge process or the deliberately stalled HTTP connection.
+  t.after(async () => {
+    lines.close();
+    child.kill();
+    await exited;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const request = { baseURL: `http://127.0.0.1:${server.address().port}/v1`, apiKey: 'mock-key',
+    maxOutputTokens: 100, headers: {}, options: { _openraid_sdk: { npm: '@ai-sdk/openai-compatible', provider: 'mock' } },
+    messages: [{ role: 'user', content: 'answer' }], tools: [] };
+  child.stdin.write(`${JSON.stringify({ id: 1, request: { ...request, model: 'stalled' } })}\n${JSON.stringify({ id: 2, request: { ...request, model: 'healthy' } })}\n`);
+  await Promise.all([admitted.promise, siblingAdmitted.promise]);
+  child.stdin.write(`${JSON.stringify({ cancel: 1 })}\n`);
+  await cancelled.promise;
+  const result = await healthy.promise;
+  assert.equal(result.error, undefined);
+  assert.equal(result.completion.content, 'still running');
+  assert.equal(child.exitCode, null, 'other agents keep the shared sidecar alive');
+});
+
 test('Azure OAuth uses bearer tokenProvider and resolved endpoint instead of stale factory URL', async () => {
   let received;
   const server = createServer(async (req, res) => {

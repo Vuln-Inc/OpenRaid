@@ -64,7 +64,7 @@ enum Command {
     },
     /// Read the durable, unfiltered global board by sequence cursor.
     Board {
-        /// Defaults to .openraid/openraid.sqlite3 (or an existing legacy root store).
+        /// Defaults to .openraid/openraid.sqlite3.
         #[arg(long)]
         database: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
@@ -75,7 +75,7 @@ enum Command {
     /// Inject an authenticated owner message and revoke stale completion votes.
     Post {
         body: String,
-        /// Defaults to .openraid/openraid.sqlite3 (or an existing legacy root store).
+        /// Defaults to .openraid/openraid.sqlite3.
         #[arg(long)]
         database: Option<PathBuf>,
     },
@@ -502,6 +502,9 @@ fn ensure_session_workspace(workspace: &std::path::Path, database: &std::path::P
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Err(error) = openraid::theme_preferences::initialize() {
+        eprintln!("Could not load saved theme; using Openraid: {error:#}");
+    }
     let workers = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)

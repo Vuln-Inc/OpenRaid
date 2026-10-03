@@ -2,25 +2,29 @@
 use anyhow::{ensure, Context, Result};
 use reqwest_mcp as http_client;
 use rmcp::{
-    model::{CallToolRequestParams, ClientConfig},
-    service::{RoleClient, RunningService},
+    model::{
+        CallToolRequestParams, CancelledNotificationParam, ClientConfig, ClientRequest,
+        JsonRpcMessage, RequestId, RequestParamsMeta,
+    },
+    service::{Peer, RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{
+        async_rw::AsyncRwTransport,
         streamable_http_client::{
             SseError, StreamableHttpClient, StreamableHttpClientTransportConfig,
             StreamableHttpError, StreamableHttpPostResponse,
         },
-        StreamableHttpClientTransport,
+        StreamableHttpClientTransport, Transport,
     },
     ServiceExt,
 };
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, Weak,
     },
 };
 use tokio::{
@@ -389,8 +393,255 @@ impl StreamableHttpClient for LifecycleHttpClient {
     }
 }
 
+const CALL_SCOPE_META: &str = "openraid/internal-call-scope";
+
+#[derive(Default)]
+struct CallScopes {
+    next: AtomicU64,
+    scopes: Mutex<HashMap<u64, Weak<CallScope>>>,
+    requests: Mutex<HashMap<RequestId, Weak<CallScope>>>,
+    peer: Mutex<Option<Peer<RoleClient>>>,
+}
+
+struct CallScope {
+    cancelled: AtomicBool,
+    stop: watch::Sender<bool>,
+    ids: Mutex<Vec<RequestId>>,
+    peer: Peer<RoleClient>,
+}
+
+fn cancel_requests(peer: Peer<RoleClient>, ids: Vec<RequestId>) {
+    if ids.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        for id in ids {
+            let _ = peer
+                .notify_cancelled(CancelledNotificationParam::new(
+                    Some(id),
+                    Some("Owner stopped or cancelled the operation".into()),
+                ))
+                .await;
+        }
+    });
+}
+
+struct CallGuard {
+    id: u64,
+    scope: Arc<CallScope>,
+    tracking: Arc<CallScopes>,
+    completed: bool,
+}
+
+impl CallGuard {
+    fn new(connection: &Connection) -> Self {
+        let tracking = connection.calls.clone();
+        let id = tracking.next.fetch_add(1, Ordering::Relaxed);
+        let scope = Arc::new(CallScope {
+            cancelled: AtomicBool::new(false),
+            stop: watch::channel(false).0,
+            ids: Mutex::new(Vec::new()),
+            peer: connection.client.peer().clone(),
+        });
+        tracking
+            .scopes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::downgrade(&scope));
+        Self {
+            id,
+            scope,
+            tracking,
+            completed: false,
+        }
+    }
+
+    fn params(&self, mut params: Value) -> Result<Value> {
+        let object = params
+            .as_object_mut()
+            .context("MCP request parameters must be an object")?;
+        let meta = object.entry("_meta").or_insert_with(|| json!({}));
+        if meta.is_null() {
+            *meta = json!({});
+        }
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert(CALL_SCOPE_META.into(), json!(self.id));
+        }
+        Ok(params)
+    }
+}
+
+impl Drop for CallGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.scope.cancelled.store(true, Ordering::Release);
+            self.scope.stop.send_replace(true);
+        }
+        self.tracking
+            .scopes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        let ids = self
+            .scope
+            .ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        {
+            let mut requests = self
+                .tracking
+                .requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in &ids {
+                requests.remove(id);
+            }
+        }
+        if !self.completed {
+            cancel_requests(self.scope.peer.clone(), ids);
+        }
+    }
+}
+
+/// Keep rmcp's typed helpers (including MRTR retries) while observing their IDs.
+/// An internal metadata marker is removed before sending anything to the server.
+struct CallTransport<T> {
+    inner: T,
+    tracking: Arc<CallScopes>,
+}
+
+impl<T: Transport<RoleClient>> Transport<RoleClient> for CallTransport<T> {
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        mut item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), Self::Error>> + Send + 'static
+    {
+        let tracked = if let JsonRpcMessage::Request(request) = &mut item {
+            let meta = match &mut request.request {
+                ClientRequest::CallToolRequest(request) => request.params.meta_mut().as_mut(),
+                ClientRequest::ReadResourceRequest(request) => request.params.meta_mut().as_mut(),
+                ClientRequest::GetPromptRequest(request) => request.params.meta_mut().as_mut(),
+                ClientRequest::ListResourcesRequest(request) => request
+                    .params
+                    .as_mut()
+                    .and_then(|params| params.meta_mut().as_mut()),
+                ClientRequest::ListPromptsRequest(request) => request
+                    .params
+                    .as_mut()
+                    .and_then(|params| params.meta_mut().as_mut()),
+                _ => None,
+            };
+            meta.and_then(|meta| meta.remove(CALL_SCOPE_META))
+                .and_then(|id| id.as_u64())
+                .map(|id| {
+                    let scope = self
+                        .tracking
+                        .scopes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&id)
+                        .and_then(Weak::upgrade);
+                    if let Some(scope) = &scope {
+                        let mut ids = scope.ids.lock().unwrap_or_else(|e| e.into_inner());
+                        if !scope.cancelled.load(Ordering::Acquire) {
+                            ids.push(request.id.clone());
+                            self.tracking
+                                .requests
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(request.id.clone(), Arc::downgrade(scope));
+                        }
+                    }
+                    (request.id.clone(), scope)
+                })
+        } else {
+            None
+        };
+        let peer = self
+            .tracking
+            .peer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let send = self.inner.send(item);
+        async move {
+            // A dropped caller can race the shared service's outbound queue.
+            if let Some((id, scope)) = &tracked {
+                if scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.cancelled.load(Ordering::Acquire))
+                {
+                    if let Some(peer) = peer {
+                        cancel_requests(peer, vec![id.clone()]);
+                    }
+                    return Ok(());
+                }
+            }
+            let result = if let Some((_, Some(scope))) = &tracked {
+                let mut stop = scope.stop.subscribe();
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        while !*stop.borrow() {
+                            if stop.changed().await.is_err() { break; }
+                        }
+                    } => Ok(()),
+                    result = send => result,
+                }
+            } else {
+                send.await
+            };
+            if let Some((id, scope)) = tracked {
+                if scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.cancelled.load(Ordering::Acquire))
+                {
+                    if let Some(peer) = peer {
+                        cancel_requests(peer, vec![id]);
+                    }
+                }
+            }
+            result
+        }
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        let message = self.inner.receive().await?;
+        let id = match &message {
+            JsonRpcMessage::Response(response) => Some(&response.id),
+            JsonRpcMessage::Error(error) => error.id.as_ref(),
+            _ => None,
+        };
+        if let Some(id) = id {
+            let scope = self
+                .tracking
+                .requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(id)
+                .and_then(|scope| scope.upgrade());
+            if let Some(scope) = scope {
+                scope
+                    .ids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|pending| pending != id);
+            }
+        }
+        Some(message)
+    }
+
+    async fn close(&mut self) -> std::result::Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
 struct Connection {
     client: RunningService<RoleClient, ClientConfig>,
+    calls: Arc<CallScopes>,
     child: AsyncMutex<Option<Child>>,
     remote: Option<Arc<RemoteLifecycle>>,
 }
@@ -555,6 +806,7 @@ impl Hub {
         server: &Server,
         info: ClientConfig,
     ) -> Result<Arc<Connection>> {
+        let calls = Arc::new(CallScopes::default());
         let client = if matches!(server.config.kind.as_str(), "local" | "stdio") {
             let program = server
                 .config
@@ -586,7 +838,11 @@ impl Hub {
             let stdout = process.stdout.take().context("MCP stdout missing")?;
             let stdin = process.stdin.take().context("MCP stdin missing")?;
             *server.pending_child.lock().await = Some(process);
-            info.serve((stdout, stdin)).await
+            info.serve(CallTransport {
+                inner: AsyncRwTransport::new_client(stdout, stdin),
+                tracking: calls.clone(),
+            })
+            .await
         } else {
             let mut config =
                 StreamableHttpClientTransportConfig::with_uri(server.config.url.clone());
@@ -614,9 +870,14 @@ impl Hub {
                 },
                 config,
             );
-            info.serve(transport).await
+            info.serve(CallTransport {
+                inner: transport,
+                tracking: calls.clone(),
+            })
+            .await
         };
         let client = client.map_err(|_| anyhow::anyhow!("MCP initialization failed"))?;
+        *calls.peer.lock().unwrap_or_else(|e| e.into_inner()) = Some(client.peer().clone());
         let capabilities = client
             .peer_info()
             .context("MCP capabilities missing")?
@@ -632,6 +893,7 @@ impl Hub {
         };
         let connection = Arc::new(Connection {
             client,
+            calls,
             child: AsyncMutex::new(server.pending_child.lock().await.take()),
             remote: server
                 .pending_remote
@@ -809,45 +1071,71 @@ impl Hub {
         let server = &self.servers[&binding.server];
         let _permit = server.permits.acquire().await?;
         let connection = self.connection(&binding.server).await?;
+        let mut guard = CallGuard::new(&connection);
         let result = match binding.kind {
             0 => serde_json::to_value(
                 connection
                     .client
                     .call_tool(serde_json::from_value::<CallToolRequestParams>(
-                        json!({"name":binding.name,"arguments":args}),
+                        guard.params(json!({"name":binding.name,"arguments":args}))?,
                     )?)
                     .await
                     .map_err(|_| anyhow::anyhow!("MCP {} tool call failed", binding.server))?,
             )?,
-            1 => serde_json::to_value(
-                connection
-                    .client
-                    .list_all_resources()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("MCP resource listing failed"))?,
-            )?,
+            1 => {
+                let mut resources = Vec::new();
+                let mut cursor = None::<String>;
+                loop {
+                    let page = connection
+                        .client
+                        .list_resources(Some(serde_json::from_value(
+                            guard.params(json!({"cursor":cursor}))?,
+                        )?))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("MCP resource listing failed"))?;
+                    resources.extend(page.resources);
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                serde_json::to_value(resources)?
+            }
             2 => serde_json::to_value(
                 connection
                     .client
-                    .read_resource(serde_json::from_value(args.clone())?)
+                    .read_resource(serde_json::from_value(guard.params(args.clone())?)?)
                     .await
                     .map_err(|_| anyhow::anyhow!("MCP resource read failed"))?,
             )?,
-            3 => serde_json::to_value(
-                connection
-                    .client
-                    .list_all_prompts()
-                    .await
-                    .map_err(|_| anyhow::anyhow!("MCP prompt listing failed"))?,
-            )?,
+            3 => {
+                let mut prompts = Vec::new();
+                let mut cursor = None::<String>;
+                loop {
+                    let page = connection
+                        .client
+                        .list_prompts(Some(serde_json::from_value(
+                            guard.params(json!({"cursor":cursor}))?,
+                        )?))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("MCP prompt listing failed"))?;
+                    prompts.extend(page.prompts);
+                    cursor = page.next_cursor;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                serde_json::to_value(prompts)?
+            }
             _ => serde_json::to_value(
                 connection
                     .client
-                    .get_prompt(serde_json::from_value(args.clone())?)
+                    .get_prompt(serde_json::from_value(guard.params(args.clone())?)?)
                     .await
                     .map_err(|_| anyhow::anyhow!("MCP prompt read failed"))?,
             )?,
         };
+        guard.completed = true;
         Ok(result)
     }
     pub async fn toggle(&self, name: &str) -> Result<()> {
@@ -992,7 +1280,22 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone)]
+    struct CallFixture {
+        events: tokio::sync::mpsc::UnboundedSender<Value>,
+        held: Arc<tokio::sync::Notify>,
+        sibling: Arc<tokio::sync::Notify>,
+    }
+
     async fn serve_fixture(mut socket: TcpStream, initializations: Arc<AtomicUsize>) -> Result<()> {
+        serve_call_fixture(&mut socket, initializations, None).await
+    }
+
+    async fn serve_call_fixture(
+        socket: &mut TcpStream,
+        initializations: Arc<AtomicUsize>,
+        control: Option<CallFixture>,
+    ) -> Result<()> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 4096];
         let end = loop {
@@ -1024,6 +1327,22 @@ mod tests {
             bytes.extend_from_slice(&chunk[..count]);
         }
         let message: Value = serde_json::from_slice(&bytes[end..end + length])?;
+        if let Some(control) = &control {
+            assert!(
+                !message.to_string().contains(CALL_SCOPE_META),
+                "internal scope leaked onto the wire"
+            );
+            let _ = control.events.send(message.clone());
+            match (
+                message["method"].as_str(),
+                message["params"]["arguments"]["text"].as_str(),
+            ) {
+                (Some("tools/call"), Some("held")) => control.held.notified().await,
+                (Some("tools/call"), Some("sibling")) => control.sibling.notified().await,
+                (Some("notifications/cancelled"), _) => control.held.notify_one(),
+                _ => {}
+            }
+        }
         if message.get("id").is_none() {
             socket
                 .write_all(
@@ -1065,6 +1384,103 @@ mod tests {
         }
         socket.shutdown().await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn dropped_mcp_call_notifies_exact_request_without_cancelling_active_sibling(
+    ) -> Result<()> {
+        struct AbortFixture(tokio::task::AbortHandle);
+        impl Drop for AbortFixture {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/mcp", listener.local_addr()?);
+            let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let control = CallFixture {
+                events,
+                held: Arc::new(tokio::sync::Notify::new()),
+                sibling: Arc::new(tokio::sync::Notify::new()),
+            };
+            let server_control = control.clone();
+            let fixture = tokio::spawn(async move {
+                let mut requests = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = accepted?;
+                            let control = server_control.clone();
+                            requests.spawn(async move {
+                                serve_call_fixture(&mut socket, Arc::new(AtomicUsize::new(0)), Some(control)).await
+                            });
+                        },
+                        result = requests.join_next(), if !requests.is_empty() => {
+                            // Dropped HTTP sends can close a held response socket.
+                            // Other connections must remain available to test isolation.
+                            let _ = result.unwrap()?;
+                        },
+                    }
+                }
+                #[allow(unreachable_code)]
+                Ok::<_, anyhow::Error>(())
+            });
+            let _fixture_guard = AbortFixture(fixture.abort_handle());
+            let hub = Hub::new(BTreeMap::from([("fixture".into(), ServerConfig::parse(
+                &json!({"url":url,"headers":{"Authorization":"Bearer fixture"}}),
+            )?)]), std::env::current_dir()?);
+            let result = async {
+                hub.connect_enabled().await;
+                let name = alias("fixture", "resources_list", 0);
+                let mut calls = tokio::task::JoinSet::new();
+                let held_hub = hub.clone();
+                let held_name = name.clone();
+                let held = calls.spawn(async move { held_hub.call(&held_name, &json!({"text":"held"})).await });
+                let sibling_hub = hub.clone();
+                let sibling_name = name.clone();
+                calls.spawn(async move { sibling_hub.call(&sibling_name, &json!({"text":"sibling"})).await });
+                let mut held_id = None;
+                let mut sibling_id = None;
+                while held_id.is_none() || sibling_id.is_none() {
+                    let message = received.recv().await.context("fixture events closed")?;
+                    if message["method"] == "tools/call" {
+                        match message["params"]["arguments"]["text"].as_str() {
+                            Some("held") => held_id = Some(message["id"].clone()),
+                            Some("sibling") => sibling_id = Some(message["id"].clone()),
+                            _ => {},
+                        }
+                    }
+                }
+                held.abort();
+                loop {
+                    let message = received.recv().await.context("fixture events closed")?;
+                    if message["method"] == "notifications/cancelled" {
+                        assert_eq!(message["params"]["requestId"], held_id.clone().unwrap());
+                        assert_ne!(message["params"]["requestId"], sibling_id.unwrap());
+                        break;
+                    }
+                }
+                control.sibling.notify_one();
+                let mut completed = 0;
+                while let Some(result) = calls.join_next().await {
+                    match result {
+                        Ok(result) => { assert_eq!(result?["content"][0]["text"], "sibling"); completed += 1; },
+                        Err(error) => assert!(error.is_cancelled()),
+                    }
+                }
+                assert_eq!(completed, 1);
+                assert_eq!(hub.call(&name, &json!({"text":"reusable"})).await?["content"][0]["text"], "reusable");
+                let connection = hub.connection("fixture").await?;
+                assert!(connection.calls.scopes.lock().unwrap().is_empty());
+                assert!(connection.calls.requests.lock().unwrap().is_empty());
+                Ok::<_, anyhow::Error>(())
+            }.await;
+            hub.shutdown().await;
+            fixture.abort();
+            let _ = fixture.await;
+            result
+        }).await?
     }
 
     #[tokio::test]

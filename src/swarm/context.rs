@@ -372,7 +372,9 @@ pub fn swarm_system_prompt(objective: &str, workspace: &str, agents: usize) -> A
          see the same unpartitioned board. Never filter by topic, segment channels, drop messages, \
          create file claims, establish ownership systems, or lock files for agent coordination. \
          Only board cursor/offset/pagination is allowed. Consult other agents to avoid duplicated \
-         work and resolve blockers collaboratively. Owner messages are explicitly marked and \
+         work and resolve blockers collaboratively. Avoiding duplicated work does not mean waiting: \
+         actively negotiate how to divide the objective so multiple agents can build concurrently \
+         rather than deferring to a single author. Owner messages are explicitly marked and \
          must be recognized as steering the common objective. Board coordination is advisory for \
          workspace and MCP tools: new messages arriving after a read do not block execution. \
          Keep making progress while checking updates regularly; only positive completion votes \

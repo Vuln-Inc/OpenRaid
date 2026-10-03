@@ -11,7 +11,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -32,6 +32,20 @@ pub struct WorkspaceTools {
     root: Arc<PathBuf>,
     io: Arc<Semaphore>,
     pty: crate::pty::Hub,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+struct OperationCancellation {
+    cancelled: Arc<AtomicBool>,
+    completed: bool,
+}
+
+impl Drop for OperationCancellation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl WorkspaceTools {
@@ -48,10 +62,57 @@ impl WorkspaceTools {
             root: Arc::new(root),
             pty: crate::pty::Hub::new(processes),
             io: Arc::new(Semaphore::new(max_processes.clamp(1, 16))),
+            cancelled: None,
         })
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> Result<Value> {
+        self.execute_observed(name, args, None).await
+    }
+
+    pub async fn execute_with_activity(
+        &self,
+        agent_id: &str,
+        name: &str,
+        args: &Value,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Result<Value> {
+        self.execute_observed(
+            name,
+            args,
+            Some(crate::pty::ProcessActivity {
+                metrics,
+                agent_id: agent_id.to_owned(),
+            }),
+        )
+        .await
+    }
+
+    async fn execute_observed(
+        &self,
+        name: &str,
+        args: &Value,
+        activity: Option<crate::pty::ProcessActivity>,
+    ) -> Result<Value> {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut operation = OperationCancellation {
+            cancelled: cancelled.clone(),
+            completed: false,
+        };
+        let mut this = self.clone();
+        this.cancelled = Some(cancelled);
+        let result = this.execute_operation(name, args, activity).await;
+        operation.completed = true;
+        result
+    }
+
+    async fn execute_operation(
+        &self,
+        name: &str,
+        args: &Value,
+        activity: Option<crate::pty::ProcessActivity>,
+    ) -> Result<Value> {
+        let generation = self.pty.generation();
         if name.starts_with("pty_") {
             let this = self.clone();
             let name = name.to_owned();
@@ -60,12 +121,22 @@ impl WorkspaceTools {
                 let workdir =
                     this.resolve(args.get("workdir").and_then(Value::as_str).unwrap_or("."))?;
                 let output_dir = this.resolve(".openraid/tool-output")?;
-                this.pty.execute(&name, &args, &workdir, &output_dir)
+                this.pty.execute_with_activity(
+                    &name,
+                    &args,
+                    &workdir,
+                    &output_dir,
+                    crate::pty::ExecutionContext {
+                        generation,
+                        activity,
+                        cancelled: this.cancelled.clone(),
+                    },
+                )
             })
             .await?;
         }
         if matches!(name, "run_command" | "exec") {
-            return self.run_command(args).await;
+            return self.run_command(args, activity, generation).await;
         }
         let permit = self.io.clone().acquire_owned().await?;
         let this = self.clone();
@@ -73,15 +144,50 @@ impl WorkspaceTools {
         let args = args.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            this.check_generation(generation)?;
             match name.as_str() {
-                "read_file" => this.read_file(&args),
-                "list_files" => this.list_files(&args),
-                "search_files" => this.search_files(&args),
-                "apply_patch" => this.apply_patch(&args),
+                "read_file" => this.read_file(&args, generation),
+                "list_files" => this.list_files(&args, generation),
+                "search_files" => this.search_files(&args, generation),
+                "apply_patch" => this.apply_patch(&args, generation),
                 _ => bail!("unknown workspace tool: {name}"),
             }
         })
         .await?
+    }
+
+    /// Owner stop terminates persistent terminals and invalidates admitted
+    /// blocking I/O, patch operations, and pending process spawns.
+    pub fn stop_processes(&self) {
+        self.pty.stop_all();
+    }
+
+    fn check_generation(&self, generation: u64) -> Result<()> {
+        if generation != self.pty.generation()
+            || self
+                .cancelled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            bail!("workspace operation cancelled by owner stop");
+        }
+        Ok(())
+    }
+
+    fn read_bytes(&self, reader: impl Read, limit: usize, generation: u64) -> Result<Vec<u8>> {
+        let mut reader = reader.take(limit as u64);
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            self.check_generation(generation)?;
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        self.check_generation(generation)?;
+        Ok(bytes)
     }
 
     pub fn schemas() -> Vec<Value> {
@@ -150,7 +256,8 @@ impl WorkspaceTools {
         })
     }
 
-    fn read_file(&self, args: &Value) -> Result<Value> {
+    fn read_file(&self, args: &Value, generation: u64) -> Result<Value> {
+        self.check_generation(generation)?;
         let path = self.resolve(required_str(args, "path")?)?;
         if path.is_dir() {
             bail!("path is a directory; use list_files");
@@ -160,8 +267,7 @@ impl WorkspaceTools {
             let mut file = fs::File::open(&path)?;
             let size = file.metadata()?.len();
             file.seek(SeekFrom::Start(start))?;
-            let mut bytes = Vec::with_capacity(PREVIEW_BYTES);
-            file.take(PREVIEW_BYTES as u64).read_to_end(&mut bytes)?;
+            let bytes = self.read_bytes(file, PREVIEW_BYTES, generation)?;
             let next = start.saturating_add(bytes.len() as u64);
             return Ok(
                 json!({"path":relative(&self.root,&path), "content":String::from_utf8_lossy(&bytes),
@@ -178,7 +284,9 @@ impl WorkspaceTools {
         let mut has_more = false;
         // fill_buf/consume bounds memory even for a multi-gigabyte single line.
         loop {
-            let (line, bytes, long, eof) = bounded_line(&mut reader, PREVIEW_BYTES)?;
+            let (line, bytes, long, eof) = bounded_line(&mut reader, PREVIEW_BYTES, || {
+                self.check_generation(generation)
+            })?;
             if eof && bytes == 0 {
                 break;
             }
@@ -205,13 +313,14 @@ impl WorkspaceTools {
                 break;
             }
         }
+        self.check_generation(generation)?;
         Ok(
             json!({"path":relative(&self.root,&path),"content":content,"offset":offset,
             "next_offset":offset+count,"has_more":has_more,"next_byte_offset":byte_offset}),
         )
     }
 
-    fn walker(&self, args: &Value) -> Result<ignore::Walk> {
+    fn walker(&self, args: &Value, generation: u64) -> Result<ignore::Walk> {
         let path = self.resolve(args.get("path").and_then(Value::as_str).unwrap_or("."))?;
         let include = args
             .get("include_ignored")
@@ -222,16 +331,23 @@ impl WorkspaceTools {
             .standard_filters(!include)
             .follow_links(false)
             .sort_by_file_path(|a, b| a.cmp(b));
-        builder.filter_entry(|entry| {
-            !matches!(
-                entry.file_name().to_str(),
-                Some(".git" | "target" | "tool-output")
-            )
+        let pty = self.pty.clone();
+        let cancelled = self.cancelled.clone();
+        builder.filter_entry(move |entry| {
+            generation == pty.generation()
+                && !cancelled
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire))
+                && !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "target" | "tool-output")
+                )
         });
         Ok(builder.build())
     }
 
-    fn list_files(&self, args: &Value) -> Result<Value> {
+    fn list_files(&self, args: &Value, generation: u64) -> Result<Value> {
+        self.check_generation(generation)?;
         let matcher = Glob::new(
             args.get("pattern")
                 .and_then(Value::as_str)
@@ -243,7 +359,8 @@ impl WorkspaceTools {
         let mut seen = 0usize;
         let mut paths = Vec::new();
         let mut has_more = false;
-        for entry in self.walker(args)? {
+        for entry in self.walker(args, generation)? {
+            self.check_generation(generation)?;
             let entry = entry?;
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
@@ -262,12 +379,14 @@ impl WorkspaceTools {
             }
             paths.push(path);
         }
+        self.check_generation(generation)?;
         Ok(
             json!({"files":paths,"offset":offset,"next_offset":offset+paths.len(),"has_more":has_more}),
         )
     }
 
-    fn search_files(&self, args: &Value) -> Result<Value> {
+    fn search_files(&self, args: &Value, generation: u64) -> Result<Value> {
+        self.check_generation(generation)?;
         let regex = Regex::new(required_str(args, "query")?)?;
         let matcher = Glob::new(
             args.get("pattern")
@@ -282,7 +401,8 @@ impl WorkspaceTools {
         let mut skipped = 0usize;
         let mut output_bytes = 0usize;
         let mut has_more = false;
-        'files: for entry in self.walker(args)? {
+        'files: for entry in self.walker(args, generation)? {
+            self.check_generation(generation)?;
             let entry = entry?;
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
@@ -296,8 +416,7 @@ impl WorkspaceTools {
                 skipped += 1;
                 continue;
             }
-            let mut bytes = Vec::new();
-            file.take(TEXT_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+            let bytes = self.read_bytes(file, TEXT_BYTES + 1, generation)?;
             if bytes.len() > TEXT_BYTES || bytes.contains(&0) {
                 skipped += 1;
                 continue;
@@ -307,6 +426,7 @@ impl WorkspaceTools {
                 continue;
             };
             for (line, body) in text.lines().enumerate() {
+                self.check_generation(generation)?;
                 if !regex.is_match(body) {
                     continue;
                 }
@@ -326,13 +446,15 @@ impl WorkspaceTools {
                 matches.push(json!({"path":path,"line":line+1,"text":&body[..end],"truncated":end<body.len()}));
             }
         }
+        self.check_generation(generation)?;
         Ok(
             json!({"matches":matches,"offset":offset,"next_offset":offset+matches.len(),
             "has_more":has_more,"skipped_binary_or_large_files":skipped}),
         )
     }
 
-    fn apply_patch(&self, args: &Value) -> Result<Value> {
+    fn apply_patch(&self, args: &Value, generation: u64) -> Result<Value> {
+        self.check_generation(generation)?;
         let patch = required_str(args, "patch")?;
         if patch.len() > PATCH_BYTES {
             bail!("patch exceeds 4 MiB");
@@ -340,6 +462,7 @@ impl WorkspaceTools {
         let operations = parse_patch(patch)?;
         let mut prepared = Vec::new();
         for operation in operations {
+            self.check_generation(generation)?;
             let path = self.resolve(&operation.path)?;
             if prepared
                 .iter()
@@ -371,7 +494,12 @@ impl WorkspaceTools {
                     if metadata.len() > PATCH_BYTES as u64 {
                         bail!("edit target exceeds 4 MiB");
                     }
-                    Some(fs::read(&path)?)
+                    let bytes =
+                        self.read_bytes(fs::File::open(&path)?, PATCH_BYTES + 1, generation)?;
+                    if bytes.len() > PATCH_BYTES {
+                        bail!("edit target exceeds 4 MiB");
+                    }
+                    Some(bytes)
                 }
             };
             if destination
@@ -399,8 +527,15 @@ impl WorkspaceTools {
         }
         // Optimistic conflict detection, no locks or file-ownership system.
         for edit in &prepared {
+            self.check_generation(generation)?;
             match &edit.original {
-                Some(bytes) if fs::read(&edit.path)? != *bytes => {
+                Some(bytes)
+                    if self.read_bytes(
+                        fs::File::open(&edit.path)?,
+                        PATCH_BYTES + 1,
+                        generation,
+                    )? != *bytes =>
+                {
                     bail!("file changed during patch preflight; re-read and coordinate")
                 }
                 None if edit.path.exists() => bail!("add target appeared during patch preflight"),
@@ -409,16 +544,21 @@ impl WorkspaceTools {
         }
         let mut changed = Vec::new();
         for edit in prepared {
+            self.check_generation(generation)?;
             let destination = edit.destination.as_ref().unwrap_or(&edit.path);
             if let Some(text) = edit.replacement {
                 if let Some(parent) = destination.parent() {
+                    self.check_generation(generation)?;
                     fs::create_dir_all(parent)?;
                 }
+                self.check_generation(generation)?;
                 fs::write(destination, text)?;
                 if destination != &edit.path {
+                    self.check_generation(generation)?;
                     fs::remove_file(&edit.path)?;
                 }
             } else {
+                self.check_generation(generation)?;
                 fs::remove_file(&edit.path)?;
             }
             changed.push(relative(&self.root, destination));
@@ -426,8 +566,14 @@ impl WorkspaceTools {
         Ok(json!({"changed":changed,"count":changed.len()}))
     }
 
-    async fn run_command(&self, args: &Value) -> Result<Value> {
+    async fn run_command(
+        &self,
+        args: &Value,
+        activity: Option<crate::pty::ProcessActivity>,
+        generation: u64,
+    ) -> Result<Value> {
         let _permit = self.pty.command_permit().await?;
+        self.check_generation(generation)?;
         let workdir = self.resolve(args.get("workdir").and_then(Value::as_str).unwrap_or("."))?;
         if !workdir.is_dir() {
             bail!("workdir must be a directory");
@@ -468,10 +614,15 @@ impl WorkspaceTools {
         let stderr_file = tokio::fs::File::create(&stderr_path).await?;
         command
             .current_dir(workdir)
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        self.check_generation(generation)?;
         let mut child = command.spawn().context("spawn command")?;
+        let mut process = CommandProcess::new(child.id().context("command PID missing")?);
         let stdout = child
             .stdout
             .take()
@@ -482,16 +633,58 @@ impl WorkspaceTools {
             .ok_or_else(|| anyhow!("stderr missing"))?;
         let (status, stdout, stderr) = tokio::join!(
             child.wait(),
-            capture(stdout, stdout_file),
-            capture(stderr, stderr_file)
+            capture(stdout, stdout_file, activity.clone()),
+            capture(stderr, stderr_file, activity)
         );
         let status = status?;
         let (stdout, stdout_bytes) = stdout?;
         let (stderr, stderr_bytes) = stderr?;
+        process.finished = true;
         Ok(json!({"exit_code":status.code(),"success":status.success(),
             "stdout":stdout,"stderr":stderr,"stdout_bytes":stdout_bytes,"stderr_bytes":stderr_bytes,
             "stdout_path":relative(&self.root,&stdout_path),"stderr_path":relative(&self.root,&stderr_path),
             "truncated":stdout_bytes>PREVIEW_BYTES as u64 || stderr_bytes>PREVIEW_BYTES as u64}))
+    }
+}
+
+/// Cancelling a tool future must terminate the shell's descendants as well as
+/// the direct Tokio child. Keep this armed until both output pipes are drained.
+struct CommandProcess {
+    pid: u32,
+    finished: bool,
+}
+
+impl CommandProcess {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            finished: false,
+        }
+    }
+}
+
+impl Drop for CommandProcess {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use nix::{
+                sys::signal::{killpg, Signal},
+                unistd::Pid,
+            };
+            let _ = killpg(Pid::from_raw(self.pid as i32), Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill.exe")
+                .args(["/F", "/T", "/PID", &self.pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -517,11 +710,16 @@ fn relative(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn bounded_line(reader: &mut impl BufRead, cap: usize) -> Result<(String, u64, bool, bool)> {
+fn bounded_line(
+    reader: &mut impl BufRead,
+    cap: usize,
+    check: impl Fn() -> Result<()>,
+) -> Result<(String, u64, bool, bool)> {
     let mut preview = Vec::new();
     let mut bytes = 0u64;
     let mut eof = false;
     loop {
+        check()?;
         let buffer = reader.fill_buf()?;
         if buffer.is_empty() {
             eof = true;
@@ -549,15 +747,20 @@ fn bounded_line(reader: &mut impl BufRead, cap: usize) -> Result<(String, u64, b
 async fn capture(
     mut reader: impl AsyncRead + Unpin,
     mut file: tokio::fs::File,
+    activity: Option<crate::pty::ProcessActivity>,
 ) -> Result<(String, u64)> {
     let mut preview = Vec::with_capacity(PREVIEW_BYTES);
     let mut buffer = [0u8; 8192];
     let mut total = 0u64;
     let mut disk_error = None;
+    let mut activity = activity.map(crate::pty::ProcessActivity::writer);
     loop {
         let length = reader.read(&mut buffer).await?;
         if length == 0 {
             break;
+        }
+        if let Some(activity) = &mut activity {
+            activity.append(&buffer[..length]);
         }
         total += length as u64;
         let count = length.min(PREVIEW_BYTES.saturating_sub(preview.len()));
@@ -567,6 +770,9 @@ async fn capture(
                 disk_error = Some(error);
             }
         }
+    }
+    if let Some(activity) = &mut activity {
+        activity.finish();
     }
     // Even a disk error must not stop draining the child and deadlock its pipes.
     if let Some(error) = disk_error {
@@ -786,6 +992,86 @@ fn apply_hunks(original: &str, hunks: &[Hunk]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_rejects_queued_blocking_patch_without_workspace_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = WorkspaceTools::new(root.path(), 1).unwrap();
+        let permit = tools.io.clone().acquire_owned().await.unwrap();
+        let args = json!({"patch":"*** Begin Patch\n*** Add File: stopped.txt\n+must not be written\n*** End Patch"});
+        let mut operation = Box::pin(tools.execute("apply_patch", &args));
+        // Poll the real API up to I/O admission, deterministically capturing its
+        // generation while the blocking-pool permit is still unavailable.
+        assert!(futures_util::poll!(operation.as_mut()).is_pending());
+        tools.stop_processes();
+        drop(permit);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), operation)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled by owner stop"));
+        assert!(!root.path().join("stopped.txt").exists());
+        tools.execute("apply_patch", &args).await.unwrap();
+        assert!(
+            root.path().join("stopped.txt").is_file(),
+            "new work uses a fresh generation"
+        );
+    }
+
+    #[test]
+    fn stop_interrupts_already_running_blocking_read_before_next_chunk() {
+        struct StopDuringRead<'a>(&'a WorkspaceTools, usize);
+        impl Read for StopDuringRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.1 += 1;
+                assert_eq!(self.1, 1, "cancelled read must not request another chunk");
+                buffer.fill(b'x');
+                self.0.stop_processes();
+                Ok(buffer.len())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let tools = WorkspaceTools::new(root.path(), 1).unwrap();
+        let generation = tools.pty.generation();
+        let mut reader = StopDuringRead(&tools, 0);
+        let error = tools
+            .read_bytes(&mut reader, TEXT_BYTES, generation)
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled by owner stop"));
+        assert_eq!(reader.1, 1);
+    }
+
+    #[test]
+    fn caller_drop_interrupts_running_read_even_with_current_stop_generation() {
+        struct DropDuringRead(Option<OperationCancellation>);
+        impl Read for DropDuringRead {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    self.0.is_some(),
+                    "dropped caller must prevent the next read"
+                );
+                buffer.fill(b'x');
+                drop(self.0.take());
+                Ok(buffer.len())
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut tools = WorkspaceTools::new(root.path(), 1).unwrap();
+        // Simulate the worker entering execute just after global stop advanced
+        // the generation, then losing its caller while blocking I/O runs.
+        tools.stop_processes();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        tools.cancelled = Some(cancelled.clone());
+        let mut reader = DropDuringRead(Some(OperationCancellation {
+            cancelled,
+            completed: false,
+        }));
+        let error = tools
+            .read_bytes(&mut reader, TEXT_BYTES, tools.pty.generation())
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled by owner stop"));
+    }
+
     #[test]
     fn exact_patch_preserves_line_endings_and_rejects_bad_context() {
         let ops=parse_patch("*** Begin Patch\n*** Update File: src/a.rs\n@@\n one\n-two\n+three\n four\n*** End Patch").unwrap();
@@ -799,7 +1085,7 @@ mod tests {
     fn line_reader_bounds_huge_single_line() {
         let bytes = vec![b'x'; PREVIEW_BYTES * 3];
         let (preview, consumed, long, eof) =
-            bounded_line(&mut std::io::Cursor::new(bytes), PREVIEW_BYTES).unwrap();
+            bounded_line(&mut std::io::Cursor::new(bytes), PREVIEW_BYTES, || Ok(())).unwrap();
         assert_eq!(preview.len(), PREVIEW_BYTES);
         assert_eq!(consumed, (PREVIEW_BYTES * 3) as u64);
         assert!(long && eof);

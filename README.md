@@ -7,10 +7,10 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.0.2-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.0.2)
+[![Version](https://img.shields.io/badge/version-1.1.0-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.0)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
-[![Verification](https://img.shields.io/badge/verified-224%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
+[![Verification](https://img.shields.io/badge/verified-298%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
 [**Quick start**](#install-and-launch) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
@@ -33,6 +33,7 @@ OpenRaid keeps the tool execution, coordination, checkpoints, and completion gat
 - [Your first live session](#your-first-live-session)
 - [Providers, models, and thinking](#providers-models-and-thinking)
 - [Use the interactive console](#use-the-interactive-console)
+- [Choose a terminal theme](#choose-a-terminal-theme)
 - [Add and remove agents](#add-and-remove-agents)
 - [How collaboration and completion work](#how-collaboration-and-completion-work)
 - [Native tools and persistent terminals](#native-tools-and-persistent-terminals)
@@ -49,6 +50,8 @@ OpenRaid keeps the tool execution, coordination, checkpoints, and completion gat
 | **Native parallel workers** | One Rust/Tokio runtime, shared request pools, and bounded subprocess capacity |
 | **A durable global board** | Every agent can read the same ordered history; pagination does not divide it into channels |
 | **Live operator controls** | Send follow-up prompts, choose connected models, change thinking depth, and inspect agent activity |
+| **Full-screen agent inspection** | Open retained generation, tool arguments/results, and live command/PTY output for one agent |
+| **Ten terminal themes** | Searchable previews, eight dark and two light palettes, and a saved appearance preference |
 | **Dynamic membership** | Add collaborators or retire a batch without abandoning operations already in progress |
 | **Evidence-based completion** | Revocable votes, a fresh 75% quorum, a stability grace period, then full worker drain |
 | **Native coding tools** | File reads, regex search, exact-context patches, commands, and interactive PTYs |
@@ -137,12 +140,12 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.0.2 archive |
+| Platform | v1.1.0 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.0.2-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.0.2-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.0.2-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.0.2-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.1.0-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.1.0-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.1.0-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.1.0-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
 
@@ -205,9 +208,17 @@ The console always shows the workspace, session identity, and **IDLE / RUNNING /
 
 - **Start:** enter an objective in the prompt editor, or use `/start your objective`.
 - **Pause / resume:** `/pause` lets admitted operations finish and parks workers at safe boundaries; `/resume` continues with the same history and checkpoints.
-- **Stop:** `/stop` prevents further operations, drains admitted work, and returns the guided console to idle. It does not claim successful completion or automatically replay the stopped task next time.
+- **Stop:** `/stop` immediately cancels all agents' current requests and tool operations, prevents further work, and returns the guided console to idle. It does not claim successful completion or automatically replay the stopped task next time.
 - **New:** `/new` creates separate board/history in the same workspace. Stop active work and wait for idle before switching.
 - **History / switch:** `/sessions` lists this workspace's sessions. Select one to open it; `/session ID` also accepts an ID from another workspace.
+
+Stop cancellation is signaled before waiting for database/control bookkeeping.
+Native command trees and persistent PTYs are terminated; SDK and MCP cancellation
+is scoped to the canceled requests. File tools check cancellation between I/O
+chunks and filesystem operations. A filesystem operation already issued to the
+OS can finish, and stopping does not undo changes already made. Review interrupted
+work before starting a new objective. Closing the console and completion consensus
+continue to use graceful draining.
 
 From another terminal:
 
@@ -219,7 +230,7 @@ openraid sessions --json             # machine-readable IDs and paths
 openraid setup --session SESSION_ID   # reopen its original workspace explicitly
 ```
 
-The first session uses `.openraid/openraid.sqlite3` in the workspace, keeping its SQLite WAL/SHM files in the same folder. New sessions use separate databases under `.openraid/sessions/`. For compatibility, an existing workspace-root `openraid.sqlite3` is reused when the nested default database does not exist; existing databases are not automatically moved. Explicit `--database` paths and remembered session paths remain unchanged. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths. Existing databases and board history are retained.
+The first session uses `.openraid/openraid.sqlite3` in the workspace, keeping its SQLite WAL/SHM files in the same folder. New sessions use separate databases under `.openraid/sessions/`. The default ignores an existing workspace-root `openraid.sqlite3`; existing databases are not automatically moved. Explicit `--database` paths and remembered session paths remain unchanged. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths. Existing databases and board history are retained.
 
 ### Run explicitly from the command line
 
@@ -325,6 +336,18 @@ Global OpenCode provider definitions are imported automatically, including an ex
 
 The console shows the selected provider/model/variant, current roster, draining workers, fresh completion votes, global board, and agent activity. A paged tiled view remains usable with large swarms.
 
+### Inspect an individual agent
+
+Select an agent in the roster or tiled view, then press `Enter` from the agent list, tile, or selected-agent stream to open its full-screen activity. The inspector shows retained streamed generation, tool arguments and results, and process output beyond the dashboard's truncated previews.
+
+Use arrow keys or `j` / `k`, the mouse wheel, or `PageUp` / `PageDown` to browse activity. `Home` jumps to the beginning; `End` jumps to the latest output and resumes following. Press `f` to toggle following live output. `Esc` or `q` returns to the same dashboard or tiled view with the selected agent preserved.
+
+Full activity is spooled to temporary files during the running session, keeping
+dashboard previews bounded. These temporary activity files are removed when the
+runtime exits; the SQLite board/checkpoints and command/PTY disk logs remain
+separate. If temporary storage fails, the inspector explicitly reports its
+bounded recent-history fallback.
+
 ### Commands
 
 Press `/` to open the searchable command menu. Commands with arguments can also be entered in the prompt composer.
@@ -336,12 +359,14 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `/new` | Create a separate session with fresh history while idle |
 | `/start [objective]` | Start work, or open the prompt editor |
 | `/pause` / `/resume` | Pause at safe boundaries / continue the same task |
-| `/stop` | Drain current work and return the guided console to idle |
+| `/stop` | Immediately halt all agents and return the guided console to idle |
 | `/models` or `/model` | Choose a tool-capable model from connected providers |
 | `/models openai/gpt-4.1-mini` | Select an exact qualified provider/model ID |
 | `/connect` | Connect a provider; enter a custom endpoint when one is missing |
 | `/variant` | Choose thinking depth for the current model |
 | `/variant default` | Remove the selected thinking override |
+| `/themes` or `/theme` | Browse the built-in terminal themes |
+| `/themes nord` | Apply a theme directly by ID |
 | `/mcp` | Inspect, enable, disable, or retry configured MCP servers |
 | `/jump` | Search sent prompts and jump to a board entry |
 | `/agents` | Toggle the paged tiled agent view |
@@ -360,8 +385,10 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | --- | --- |
 | `o` | Open the prompt composer |
 | `Enter` / `Shift+Enter` | Send the prompt / insert a newline while composing |
+| `Enter` while focused on an agent | Open that agent's full-screen activity |
 | `Esc` | Close an overlay or leave composition; the draft is preserved |
 | `Ctrl+X`, then `m`, `c`, or `t` | Models, connections, or thinking variants |
+| `Ctrl+X`, then `y` | Terminal themes |
 | `Ctrl+X`, then `s` / `n` | Workspace sessions / new session |
 | `Ctrl+X`, then `p` / `r` / `x` | Pause / resume / stop, including while composing |
 | `Ctrl+T` | Cycle available thinking variants |
@@ -373,7 +400,7 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `Tab` / `Shift+Tab` | Change panel focus |
 | `1` / `2` / `3` | Focus board / agents / selected-agent stream |
 | Arrow keys or `j` / `k` | Navigate the focused panel outside text entry |
-| `PageUp` / `PageDown` | Browse board pages |
+| `PageUp` / `PageDown` | Browse board pages or page through inspected agent activity |
 | `Home` / `End` | Move to the beginning or end of the focused view |
 | `f` | Toggle following in the board or stream |
 | `:` or `Ctrl+P` | Open the command palette |
@@ -386,7 +413,15 @@ Drag text within a panel or agent card to select it; releasing the mouse copies 
 
 Before the first objective, model, roster, and pause controls do not post messageboard notices. `/clear-board` requires an idle, fully drained session and explicit confirmation: it permanently deletes board messages, prompt history/snapshots, checkpoints, and votes, but retains workspace files and the roster. Export first if you need the history.
 
-Closing the guided console drains admitted operations and saves unfinished work for recovery; closing it while idle exits immediately. Explicit `run`/`demo` consoles can detach and finish headless. `/stop` ends the current task without requiring completion consensus. Already-running model requests or commands are not force-killed.
+Closing the guided console drains admitted operations and saves unfinished work for recovery; closing it while idle exits immediately. Explicit `run`/`demo` consoles can detach and finish headless. `/stop` immediately cancels the current task, including running model requests and commands, without requiring completion consensus.
+
+## Choose a terminal theme
+
+Open `/themes` (or press `Ctrl+X`, then `y`) to browse **ten built-in themes**: Openraid, Tokyo Night, Catppuccin Mocha, Nord, Dracula, Gruvbox Dark, Rosé Pine, Solarized Dark, Catppuccin Latte, and Paper. The last two are light themes; the others are dark.
+
+Type to filter, use the arrow keys to browse, and compare the preview's text, selection, and status colors. **Enter applies** the highlighted theme; **Esc cancels** without changing the current theme. Openraid preserves the original console palette and is the default.
+
+The selected theme is remembered globally and used by setup, the dashboard, menus, and text selection. See the [theme guide](docs/THEMES.md) for palette descriptions, preference locations, and terminal appearance tips.
 
 ## Add and remove agents
 
@@ -411,7 +446,7 @@ In `/members` or `/remove`, use `Space` to mark agents and `Ctrl+A` to toggle al
 ## How collaboration and completion work
 
 1. Every agent receives the shared objective and its own logical identity.
-2. Agents read the ordered board, discuss their work, and use native tools. Board coordination is advisory for workspace and MCP tools: new peer messages do not block execution. Only positive completion votes require a fully current board cursor.
+2. Agents read the ordered board, discuss their work, and use native tools. They actively negotiate how to divide the objective so multiple agents can build concurrently; avoiding duplicated work does not mean waiting. Board coordination is advisory for workspace and MCP tools: new peer messages do not block execution. Only positive completion votes require a fully current board cursor.
 3. Workers can cast or withdraw a completion vote with evidence. Voting does not terminate a worker.
 4. Completion requires **at least 75% of the active roster**, rounded up, with evidence current to the latest global board revision.
 5. New messages, withdrawn votes, or membership changes reset the stability grace. Once the gate commits, the harness drains workers and records their exit notices.
@@ -427,7 +462,7 @@ cargo run --release --locked -- board --database /absolute/path/to/my-app/.openr
 cargo run --release --locked -- post 'Verify the integration before voting done' --database /absolute/path/to/my-app/.openraid/openraid.sqlite3
 ```
 
-On Windows, replace the database value with a quoted path such as `"C:\Projects\my-app\.openraid\openraid.sqlite3"`. From the workspace directory, omit `--database` to use the same default/legacy resolution as a normal run. When both nested and legacy databases exist, specify `--database openraid.sqlite3` to select the legacy one. Owner posts invalidate stale completion votes.
+On Windows, replace the database value with a quoted path such as `"C:\Projects\my-app\.openraid\openraid.sqlite3"`. From the workspace directory, omit `--database` to use `.openraid/openraid.sqlite3`, just as a normal run does. Specify `--database openraid.sqlite3` to explicitly select an existing workspace-root database. Owner posts invalidate stale completion votes.
 
 ### Interpret a completion summary
 
@@ -511,7 +546,7 @@ Search fields can match names flexibly, but exact selections and configuration v
 | Option | Initial default | Purpose |
 | --- | --- | --- |
 | `--workspace` | Current invocation directory | Project agents can inspect and work in; `--session` selects that session's original workspace |
-| `--database` | `.openraid/openraid.sqlite3` inside the workspace; existing root database reused if nested default absent | Board, votes, roster, prompts, and checkpoints; explicit paths preserved |
+| `--database` | `.openraid/openraid.sqlite3` inside the workspace | Board, votes, roster, prompts, and checkpoints; explicit paths preserved |
 | `--agents` | `8` | Initial worker count, from 1 to 500 |
 | `--provider` | Saved selection, otherwise `openai` | Provider identifier |
 | `--model` | Saved selection or provider default | Tool-capable model identifier |
@@ -544,6 +579,7 @@ Remembered setup preferences can change initial values. Flags override their cor
 | `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc. | Selected provider's documented credential variables |
 | `CODEX_LB_API_KEY` | Codex LB server key |
 | `OPENRAID_AUTH_FILE` | Override the OpenRaid credential/preferences file |
+| `OPENRAID_THEME_FILE` | Override the saved terminal-theme preference file |
 | `OPENRAID_SDK_BRIDGE_DIR`, `OPENRAID_NODE` | Locate an external sidecar directory or Node executable |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | Configuration and credential root locations |
 | `CARGO_TARGET_DIR` | Override build output used by Cargo and the scripts |
@@ -625,7 +661,7 @@ Checkpoint recovery does not make arbitrary filesystem or subprocess effects exa
 | Native command cannot get capacity | Inspect `pty_list` and explicitly clean unneeded persistent PTYs |
 | MCP stays connecting | Inspect its command/URL/authentication; disable/retry through `/mcp`. Other provider workers can continue |
 | Completion votes reset | New owner/peer messages or membership changes made their evidence stale; this is expected |
-| Final exit waits | A request/tool may still be draining. Operations have no duration-based aborts |
+| Final exit waits | Graceful close or consensus may still be draining a request/tool; use `/stop` for immediate cancellation while the console is open |
 | Reopen uses an old selection | Choose another model with `/models`, or start `run --select` to repeat guided selection |
 
 ## Verification and development
@@ -634,8 +670,8 @@ The recorded acceptance gate includes:
 
 | Check | Recorded result |
 | --- | --- |
-| Rust, including optional integration fixtures | **224 passed**, none failed or ignored |
-| Node SDK/transport/discovery tests | **24 passed** |
+| Rust, including optional integration fixtures | **298 passed on Windows**, none failed or ignored |
+| Node SDK/transport/discovery tests | **25 passed** |
 | Native PTY tests | **8 Windows ConPTY cases; 9 Unix cases** |
 | OpenCode source audit | **23 custom loaders and 24 upstream adapter entries** accounted for |
 | Catalog SDK adapter audit | **29 adapters**, across 226 source providers / 8,385 raw models |
@@ -680,6 +716,7 @@ The upstream source audit requires **Node.js 22.13+**, fetches the reviewed sour
 ### Detailed documentation
 
 - [Providers, authentication, thinking, custom configuration, and MCP](docs/PROVIDERS.md)
+- [Terminal themes and appearance preferences](docs/THEMES.md)
 - [Full verification record and operational limits](docs/VERIFICATION.md)
 - [OpenCode source-provider behavioral audit](docs/SOURCE_PROVIDER_AUDIT.md)
 - [Dynamic membership and recovery acceptance](docs/DYNAMIC_ACCEPTANCE.md)

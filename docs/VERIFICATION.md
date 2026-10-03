@@ -1,5 +1,42 @@
 # Verification record
 
+## v1.1.0 — Themes and issues #11–#14
+
+The combined implementation's Windows acceptance passed **298 Rust tests**
+(`cargo test --locked --all-targets -- --include-ignored`): 174 library,
+18 binary/CLI-configuration, and 106 integration tests, with zero failures or
+ignored tests. The Node SDK/provider/HTTP suite passed **25/25**. Repository-wide
+formatting and whitespace checks also passed. Direct release preparation reran
+the complete Windows gate with version 1.1.0 and passed the same 298 tests and
+25 Node tests. Warnings-denied all-target Clippy passed after grouping the PTY
+helper's execution metadata and removing an unnecessary owned test comparison.
+
+This gate covers:
+
+- Ten semantic theme palettes, at least 4.5:1 text/status/selection contrast,
+  Unicode aliases, saved preferences and error cleanup, local previews,
+  dark/light filtering, compact layouts, and theme routing during remote work.
+- Full-screen individual-agent inspection, preserved dashboard return, all 11
+  navigation/render regressions, histories beyond 65,535 rows, tool details,
+  authenticated live output, split Unicode, per-agent isolation, and spool cleanup.
+- Immediate operator stop during requests, commands, PTYs, consensus drain,
+  snapshot preparation, and SQLite/control-lock contention. Queued mutations and
+  running blocking reads observe generation and caller-drop cancellation.
+- SDK caller-drop cancellation, actual HTTP abort with an already-active sibling,
+  exact-ID MCP cancellation and reusable shared connections, plus real stdio cleanup.
+- Unconditional nested database defaults, root database/WAL/SHM preservation,
+  explicit paths, and the concurrency-prompt clarification.
+
+Activity transcripts use temporary per-agent spools for the current runtime,
+separate from durable SQLite board/checkpoint state and process output logs.
+Stop does not roll back previously completed filesystem side effects; already-issued
+OS operations can finish before the next cooperative cancellation boundary.
+
+Four-platform release CI gates publication on native tests, formatting, all-target
+warnings-denied Clippy, Node tests, optimized builds, and 500-worker offline smoke
+checks on Windows, Linux, macOS Intel, and macOS Apple Silicon. Historical records
+below describe their corresponding versions rather than the current stop semantics.
+
 ## Session controls and directory isolation — issue #4
 
 The final v1.0.1 session-control update was verified on **2026-10-03** using native

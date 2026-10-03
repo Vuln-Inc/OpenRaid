@@ -4,11 +4,11 @@ use crate::{
     provider::{Protocol, Provider, ProviderConfig},
     storage::{Membership, Store},
 };
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
 };
@@ -50,8 +50,10 @@ pub struct SessionControl {
     snapshots: Arc<Mutex<()>>,
     pending_prompts: Arc<AtomicUsize>,
     interruptions: Arc<AtomicU64>,
+    stop_pending: Arc<AtomicBool>,
     membership: watch::Sender<Arc<Membership>>,
     worker_stops: Arc<StdMutex<HashMap<String, watch::Sender<bool>>>>,
+    workspace: Option<crate::workspace::WorkspaceTools>,
     store: Store,
 }
 
@@ -125,8 +127,10 @@ impl SessionControl {
             snapshots: Arc::new(Mutex::new(())),
             pending_prompts: Arc::new(AtomicUsize::new(0)),
             interruptions: Arc::new(AtomicU64::new(0)),
+            stop_pending: Arc::new(AtomicBool::new(false)),
             membership,
             worker_stops: Arc::new(StdMutex::new(HashMap::new())),
+            workspace: None,
         }
     }
     pub fn with_membership(self, membership: Membership) -> Self {
@@ -222,6 +226,10 @@ impl SessionControl {
         self.mcp = mcp;
         self
     }
+    pub fn with_workspace(mut self, workspace: crate::workspace::WorkspaceTools) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
     pub fn current(&self) -> Arc<ActiveModel> {
         self.models.borrow().clone()
     }
@@ -241,10 +249,31 @@ impl SessionControl {
         *self.paused.borrow()
     }
     pub fn is_stopping(&self) -> bool {
-        self.is_busy() && (*self.round.borrow() || self.is_closing())
+        self.stop_pending.load(Ordering::Acquire)
+            || *self.round.borrow()
+            || (self.is_busy() && self.is_closing())
     }
     pub(crate) fn work_was_stopped(&self) -> bool {
         *self.work_stopped.borrow()
+    }
+    pub(crate) fn work_stop_receiver(&self) -> watch::Receiver<bool> {
+        self.work_stopped.subscribe()
+    }
+    pub(crate) async fn wait_for_work_stop(&self) {
+        let mut stop = self.work_stop_receiver();
+        while !*stop.borrow() {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    async fn wait_for_interruption(&self, generation: u64) {
+        let mut stop = self.work_stop_receiver();
+        while self.interruptions.load(Ordering::Acquire) == generation {
+            if stop.changed().await.is_err() {
+                break;
+            }
+        }
     }
     pub(crate) fn drain_cursor(&self) -> u64 {
         *self.drain_cursor.borrow()
@@ -290,15 +319,37 @@ impl SessionControl {
             .await?;
         Ok(())
     }
-    /// Stop the current task without claiming successful completion. Already
-    /// admitted operations drain, and the interactive console remains open.
+    /// Immediately cancel the current task without claiming successful completion.
+    /// The interactive console remains open for another prompt.
     pub async fn stop_work(&self) -> Result<()> {
-        let _change = self.changes.lock().await;
         ensure!(!self.is_closing(), "session is closing");
-        if !self.is_busy() || *self.round.borrow() {
+        if !self.is_busy() || (self.work_was_stopped() && *self.round.borrow()) {
+            if let Some(workspace) = &self.workspace {
+                workspace.stop_processes();
+            }
             return Ok(());
         }
-        self.drain_work(true).await
+        if self.stop_pending.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        // Wake every worker before waiting for the durable drain transaction.
+        // Neither a busy SQLite actor nor another control holding `changes`
+        // may delay cancellation. Admission observes stop_pending meanwhile.
+        self.interruptions.fetch_add(1, Ordering::AcqRel);
+        self.work_stopped.send_replace(true);
+        if let Some(workspace) = &self.workspace {
+            workspace.stop_processes();
+        }
+        self.paused.send_replace(false);
+        // Once cancellation is published, its durable bookkeeping must survive
+        // a dropped UI/control caller even while another change owns the lock.
+        let control = self.clone();
+        tokio::spawn(async move {
+            let _change = control.changes.lock().await;
+            control.drain_work(true).await
+        })
+        .await
+        .context("stop bookkeeping task failed")?
     }
     pub(crate) async fn drain_work(&self, stopped: bool) -> Result<()> {
         let round = self.round.clone();
@@ -306,10 +357,11 @@ impl SessionControl {
         let work_stopped = self.work_stopped.clone();
         let cursor = self.drain_cursor.clone();
         let interruptions = self.interruptions.clone();
+        let stop_pending = self.stop_pending.clone();
         self.store
             .drain_round(
                 if stopped {
-                    "Owner stopped current work; draining in-flight operations."
+                    "Owner stopped current work; cancelling in-flight operations immediately."
                 } else {
                     "Owner closed session; draining in-flight operations."
                 }
@@ -320,6 +372,7 @@ impl SessionControl {
                     work_stopped.send_replace(stopped);
                     round.send_replace(true);
                     paused.send_replace(false);
+                    stop_pending.store(false, Ordering::Release);
                 },
             )
             .await?;
@@ -373,12 +426,19 @@ impl SessionControl {
     /// the runtime selected a queued prompt must not be cleared by startup.
     pub(crate) async fn try_begin_work(&self) -> bool {
         let _change = self.changes.lock().await;
-        if *self.round.borrow() || self.is_closing() {
+        let interruption = self.interruptions.load(Ordering::Acquire);
+        if *self.round.borrow() || self.is_closing() || self.stop_pending.load(Ordering::Acquire) {
             return false;
         }
         self.work_stopped.send_replace(false);
         self.drain_cursor.send_replace(0);
         self.busy.send_replace(true);
+        if self.stop_pending.load(Ordering::Acquire)
+            || self.interruptions.load(Ordering::Acquire) != interruption
+        {
+            self.work_stopped.send_replace(true);
+            return false;
+        }
         true
     }
 
@@ -390,11 +450,21 @@ impl SessionControl {
         let _pending = PendingPrompt(self.pending_prompts.clone());
         // Git capture may traverse a large workspace. Keep it serialized with
         // restore, while leaving pause/stop/model controls responsive.
-        let _snapshot = self.snapshots.lock().await;
+        let _snapshot = tokio::select! {
+            biased;
+            _ = self.wait_for_interruption(interruption) => {
+                bail!("prompt cancelled because the owner stopped work while preparing its snapshot");
+            }
+            snapshot = self.snapshots.lock() => snapshot,
+        };
         let config = self.current().config.clone();
-        let snapshot = crate::snapshots::capture(&config.workspace, &config.database)
-            .await
-            .ok();
+        let snapshot = tokio::select! {
+            biased;
+            _ = self.wait_for_interruption(interruption) => {
+                bail!("prompt cancelled because the owner stopped work while preparing its snapshot");
+            }
+            snapshot = crate::snapshots::capture(&config.workspace, &config.database) => snapshot.ok(),
+        };
         let _change = self.changes.lock().await;
         ensure!(!self.is_closing(), "session is closing");
         ensure!(
@@ -519,11 +589,11 @@ mod tests {
             "late round admission cannot erase an acknowledged stop"
         );
         assert!(control.work_was_stopped());
-        drop(capture);
         let error = tokio::time::timeout(Duration::from_secs(2), posting)
             .await??
             .unwrap_err();
         assert!(error.to_string().contains("prompt cancelled"));
+        drop(capture);
         assert!(
             harness.store.prompts().await?.is_empty(),
             "stopped in-preparation prompt is never committed later"

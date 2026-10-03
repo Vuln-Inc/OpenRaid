@@ -9,7 +9,7 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::{storage::Store, workspace::WorkspaceTools};
+use crate::{metrics::Metrics, storage::Store, workspace::WorkspaceTools};
 
 const MAX_BOARD_PAGE: usize = 128;
 const MAX_POST_BYTES: usize = 64 * 1024;
@@ -21,6 +21,7 @@ pub struct ToolBus {
     // Only scalar delivery cursors live here, never a replicated board.
     delivered: Arc<Mutex<HashMap<String, u64>>>,
     mcp: crate::mcp::Hub,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl ToolBus {
@@ -30,11 +31,17 @@ impl ToolBus {
             workspace,
             delivered: Arc::new(Mutex::new(HashMap::new())),
             mcp: crate::mcp::Hub::default(),
+            metrics: None,
         }
     }
 
     pub fn with_mcp(mut self, mcp: crate::mcp::Hub) -> Self {
         self.mcp = mcp;
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -147,7 +154,14 @@ impl ToolBus {
             | "pty_list" => {
                 // Coordination is advisory during work: peer traffic must not
                 // prevent progress. Only positive votes require a current board.
-                self.workspace.execute(name, args).await
+                match &self.metrics {
+                    Some(metrics) => {
+                        self.workspace
+                            .execute_with_activity(agent_id, name, args, metrics.clone())
+                            .await
+                    }
+                    None => self.workspace.execute(name, args).await,
+                }
             }
             _ => bail!("unknown native tool: {name}"),
         }
@@ -229,6 +243,64 @@ mod tests {
         let store = Store::open(root.path().join("swarm.sqlite")).await.unwrap();
         let workspace = WorkspaceTools::new(root.path(), 2).unwrap();
         (root, ToolBus::new(store, workspace))
+    }
+
+    #[tokio::test]
+    async fn process_activity_is_live_and_authenticated_before_tool_finishes() {
+        let (root, bus) = fixture().await;
+        let metrics = Arc::new(Metrics::new(2));
+        let bus = bus.with_metrics(metrics.clone());
+        #[cfg(windows)]
+        let args = json!({
+            "program":"powershell.exe",
+            "args":["-NoProfile", "-Command", "[Console]::Out.WriteLine('live-before-completion'); while (-not (Test-Path -LiteralPath 'release.txt')) { Start-Sleep -Milliseconds 10 }; [Console]::Out.WriteLine('after-release')"]
+        });
+        #[cfg(not(windows))]
+        let args = json!({
+            "program":"sh",
+            "args":["-c", "printf 'live-before-completion\\n'; while [ ! -f release.txt ]; do sleep 0.01; done; printf 'after-release\\n'"]
+        });
+        let mut task =
+            tokio::spawn(async move { bus.execute("agent-001", "run_command", &args).await });
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if metrics
+                    .agent_activity("agent-001")
+                    .contains("live-before-completion")
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Always release the process, including a failure, so this test leaves no child behind.
+        let was_running = !task.is_finished();
+        tokio::fs::write(root.path().join("release.txt"), "release")
+            .await
+            .unwrap();
+        let result = match tokio::time::timeout(std::time::Duration::from_secs(10), &mut task).await
+        {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                panic!("released command did not finish");
+            }
+        };
+        assert!(
+            observed.is_ok(),
+            "process output was not observable before completion"
+        );
+        assert!(
+            was_running,
+            "stream was inspected only after tool completion"
+        );
+        assert_eq!(result["success"], true);
+        assert!(metrics
+            .agent_activity("agent-001")
+            .contains("after-release"));
+        assert!(metrics.agent_activity("agent-002").is_empty());
     }
 
     #[tokio::test]
