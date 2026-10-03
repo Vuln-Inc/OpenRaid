@@ -42,7 +42,7 @@ impl ToolBus {
         let mut tools = vec![
             definition(
                 "board_read",
-                "Read the shared global board in sequence order. All agents see the same messages. Only cursor and page size pagination exist. Read subsequent pages while has_more is true before edits or completion votes.",
+                "Read the shared global board in sequence order. All agents see the same messages. Only cursor and page size pagination exist. Coordinate contributions through the board; new messages do not block workspace or MCP tools. Read subsequent pages while has_more is true before a positive completion vote.",
                 json!({
                     "after": {"type":"integer", "minimum":0, "description":"Exclusive sequence cursor, initially zero."},
                     "limit": {"type":"integer", "minimum":1, "maximum":MAX_BOARD_PAGE, "description":"Page size, default 64."}
@@ -81,7 +81,6 @@ impl ToolBus {
     pub async fn execute(&self, agent_id: &str, name: &str, args: &Value) -> Result<Value> {
         validate_identity(agent_id)?;
         if self.mcp.contains(name) {
-            self.require_fresh_board(agent_id).await?;
             return self.mcp.call(name, args).await;
         }
         match name {
@@ -144,11 +143,10 @@ impl ToolBus {
                 Ok(json!({"accepted":true, "done":done, "worker_must_remain_active":true}))
             }
             "apply_patch" | "run_command" | "pty_spawn" | "pty_write" | "pty_resize"
-            | "pty_kill" => {
-                self.require_fresh_board(agent_id).await?;
-                self.workspace.execute(name, args).await
-            }
-            "read_file" | "list_files" | "search_files" | "pty_read" | "pty_list" => {
+            | "pty_kill" | "read_file" | "list_files" | "search_files" | "pty_read"
+            | "pty_list" => {
+                // Coordination is advisory during work: peer traffic must not
+                // prevent progress. Only positive votes require a current board.
                 self.workspace.execute(name, args).await
             }
             _ => bail!("unknown native tool: {name}"),
@@ -161,15 +159,6 @@ impl ToolBus {
         if after <= *cursor {
             *cursor = (*cursor).max(next);
         }
-    }
-
-    async fn require_fresh_board(&self, agent_id: &str) -> Result<()> {
-        let latest = self.store.latest_seq().await?;
-        let seen = self.delivered_cursor(agent_id);
-        if seen < latest {
-            bail!("unread global board messages: your delivered cursor is {seen}, latest is {latest}; call board_read after {seen} and paginate until current before acting");
-        }
-        Ok(())
     }
 
     fn delivered_cursor(&self, agent_id: &str) -> u64 {
@@ -343,9 +332,24 @@ mod tests {
         assert!(bus
             .execute("agent-001", "run_command", &json!({"command":"echo stale"}))
             .await
+            .is_ok());
+        assert!(bus
+            .execute(
+                "agent-001",
+                "vote_done",
+                &json!({"done":true,"evidence":"tests passed"})
+            )
+            .await
             .is_err());
         bus.observe_board("agent-001", 1);
-        assert!(bus.require_fresh_board("agent-001").await.is_ok());
+        assert!(bus
+            .execute(
+                "agent-001",
+                "vote_done",
+                &json!({"done":true,"evidence":"tests passed"})
+            )
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

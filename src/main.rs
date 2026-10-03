@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use openraid::{
     auth::AuthStore,
     catalog::{is_codex_provider, Catalog},
-    config::Config,
+    config::{default_database_path, Config},
     provider::Protocol,
     runtime::Harness,
     setup::{Choice, SetupUi},
@@ -64,8 +64,9 @@ enum Command {
     },
     /// Read the durable, unfiltered global board by sequence cursor.
     Board {
-        #[arg(long, default_value = "openraid.sqlite3")]
-        database: PathBuf,
+        /// Defaults to .openraid/openraid.sqlite3 (or an existing legacy root store).
+        #[arg(long)]
+        database: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         after: u64,
         #[arg(long, default_value_t = 100)]
@@ -74,8 +75,9 @@ enum Command {
     /// Inject an authenticated owner message and revoke stale completion votes.
     Post {
         body: String,
-        #[arg(long, default_value = "openraid.sqlite3")]
-        database: PathBuf,
+        /// Defaults to .openraid/openraid.sqlite3 (or an existing legacy root store).
+        #[arg(long)]
+        database: Option<PathBuf>,
     },
 }
 
@@ -255,7 +257,7 @@ impl RunArgs {
                     .as_ref()
                     .filter(|profile| profile.workspace == workspace)
                     .map(|profile| profile.database.clone())
-                    .unwrap_or_else(|| PathBuf::from("openraid.sqlite3"))
+                    .unwrap_or_else(|| default_database_path(&workspace))
             });
         let database = if database.is_absolute() {
             database
@@ -647,6 +649,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             after,
             limit,
         } => {
+            let database =
+                database.unwrap_or_else(|| default_database_path(std::path::Path::new(".")));
             let store = Store::open(database).await?;
             let messages = store.read_board(after, limit).await?;
             println!("{}", serde_json::to_string_pretty(&messages)?);
@@ -656,6 +660,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             if body.trim().is_empty() {
                 bail!("owner message must not be empty");
             }
+            let database =
+                database.unwrap_or_else(|| default_database_path(std::path::Path::new(".")));
             let store = Store::open(database).await?;
             let message = store.append("owner", &body, true).await?;
             println!("{}", serde_json::to_string_pretty(&message)?);
@@ -1743,7 +1749,7 @@ mod tests {
             .unwrap();
         let cwd = std::fs::canonicalize(".").unwrap();
         assert_eq!(config.workspace, cwd);
-        assert_eq!(config.database, cwd.join("openraid.sqlite3"));
+        assert_eq!(config.database, default_database_path(&cwd));
         assert_eq!(config.config_path, None);
     }
 

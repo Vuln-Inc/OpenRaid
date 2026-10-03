@@ -88,7 +88,9 @@ Coverage uses the real OS backend and includes:
   before the ConPTY startup handshake.
 - Full persisted output exceeding 96 KiB with bounded, exact byte pagination.
 - Split Unicode codepoints recoverable through `content_hex`.
-- Shared registry and fresh-global-board enforcement before mutations.
+- Shared registry and fresh-global-board enforcement before mutations (the frozen
+  run's policy; workspace/PTY execution is now advisory-board coordinated, while
+  positive completion votes still require a fully current board).
 - Admission feedback when persistent PTYs occupy all process slots, while
   ordinary commands retain normal queueing with partial PTY occupancy.
 - Explicit kill releasing a maximum-size concurrent write to a never-reading

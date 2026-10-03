@@ -269,6 +269,10 @@ impl SessionControl {
             return Ok(());
         }
         let signal = self.paused.clone();
+        if !self.store.has_started().await? {
+            signal.send_replace(paused);
+            return Ok(());
+        }
         self.store
             .owner_action(
                 "owner-control",
@@ -346,6 +350,17 @@ impl SessionControl {
     }
     pub fn set_busy(&self, busy: bool) {
         self.busy.send_replace(busy);
+    }
+
+    pub async fn clear_board(&self) -> Result<()> {
+        let _snapshot = self.snapshots.lock().await;
+        let _change = self.changes.lock().await;
+        ensure!(!self.is_closing(), "session is closing");
+        ensure!(
+            !self.is_busy(),
+            "stop work and wait for all workers to drain before clearing the board"
+        );
+        self.store.clear_board().await
     }
     pub async fn begin_work(&self) {
         let _change = self.changes.lock().await;
@@ -451,6 +466,10 @@ impl SessionControl {
             revision: current.revision + 1,
         });
         let models = self.models.clone();
+        if !self.store.has_started().await? {
+            models.send_replace(next);
+            return Ok(());
+        }
         self.store
             .owner_action("owner-control", body, self.round.subscribe(), move || {
                 models.send_replace(next);

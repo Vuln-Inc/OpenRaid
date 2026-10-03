@@ -71,23 +71,11 @@ async fn parallel_idle_mutations_are_durable_and_persistent_rounds_use_current_r
             expected
         );
         let notices = store.read_board(0, 10_000).await?;
-        for id in &allocated {
-            assert!(
-                notices
-                    .iter()
-                    .any(|entry| entry.owner && entry.body.contains(id)),
-                "added member {id} must have a durable global notice"
-            );
-        }
+        assert!(
+            notices.is_empty(),
+            "pre-objective roster controls must not pollute the messageboard"
+        );
         for id in first.iter().chain(&second[..2]) {
-            assert!(
-                notices
-                    .iter()
-                    .filter(|entry| entry.owner && entry.body.contains(id))
-                    .count()
-                    >= 2,
-                "removed member {id} needs a separate durable notice"
-            );
             assert!(
                 store.vote(id).await?.is_none(),
                 "retired votes cannot survive removal"
@@ -102,7 +90,17 @@ async fn parallel_idle_mutations_are_durable_and_persistent_rounds_use_current_r
         assert_eq!(
             reopened.read_board(0, 10_000).await?,
             notices,
-            "membership notices survive an independent database reopen"
+            "pre-objective board silence survives an independent database reopen"
+        );
+        assert_eq!(
+            reopened
+                .membership()
+                .await?
+                .agent_ids
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            expected,
+            "silent pre-objective roster changes are still durable"
         );
         let run = tokio::spawn(harness.run());
         for (index, prompt) in ["first roster-aware round", "second roster-aware round"]

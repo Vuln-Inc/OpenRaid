@@ -20,6 +20,7 @@ pub async fn copy(text: &str) -> Result<()> {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
         {
             if let Some(mut input) = child.stdin.take() {

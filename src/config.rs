@@ -1,5 +1,21 @@
 use anyhow::{bail, Result};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+/// Keep SQLite and its WAL/SHM sidecars together inside the workspace.
+/// Existing root-level stores remain usable without moving a potentially live database.
+pub fn default_database_path(workspace: &Path) -> PathBuf {
+    let database = workspace.join(".openraid").join("openraid.sqlite3");
+    let legacy = workspace.join("openraid.sqlite3");
+    if !database.is_file() && legacy.is_file() {
+        legacy
+    } else {
+        database
+    }
+}
 
 /// Shared settings for the single-process swarm. The grace period applies only
 /// to completion consensus, never to an operation or provider request.
@@ -42,7 +58,7 @@ impl Default for Config {
         Self {
             agents: 8,
             workspace: PathBuf::from("."),
-            database: PathBuf::from("openraid.sqlite3"),
+            database: default_database_path(Path::new(".")),
             objective: String::new(),
             mock: false,
             model: "gpt-4.1-mini".into(),
@@ -104,5 +120,27 @@ impl Config {
             bail!("provider base URL must not be empty");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_database_path;
+
+    #[test]
+    fn default_store_is_nested_and_legacy_store_remains_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join(".openraid").join("openraid.sqlite3");
+        let legacy = directory.path().join("openraid.sqlite3");
+        assert_eq!(default_database_path(directory.path()), nested);
+        assert!(!nested.parent().unwrap().exists());
+
+        std::fs::write(&legacy, "legacy").unwrap();
+        assert_eq!(default_database_path(directory.path()), legacy);
+
+        std::fs::create_dir(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "nested").unwrap();
+        assert_eq!(default_database_path(directory.path()), nested);
+        assert_eq!(std::fs::read_to_string(legacy).unwrap(), "legacy");
     }
 }

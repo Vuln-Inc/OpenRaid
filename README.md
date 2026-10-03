@@ -219,7 +219,7 @@ openraid sessions --json             # machine-readable IDs and paths
 openraid setup --session SESSION_ID   # reopen its original workspace explicitly
 ```
 
-The first session uses `openraid.sqlite3` in the workspace. New sessions use separate databases under `.openraid/sessions/`. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths. Existing databases and board history are retained.
+The first session uses `.openraid/openraid.sqlite3` in the workspace, keeping its SQLite WAL/SHM files in the same folder. New sessions use separate databases under `.openraid/sessions/`. For compatibility, an existing workspace-root `openraid.sqlite3` is reused when the nested default database does not exist; existing databases are not automatically moved. Explicit `--database` paths and remembered session paths remain unchanged. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths. Existing databases and board history are retained.
 
 ### Run explicitly from the command line
 
@@ -346,8 +346,11 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `/jump` | Search sent prompts and jump to a board entry |
 | `/agents` | Toggle the paged tiled agent view |
 | `/members` | Open roster management |
-| `/add 3` | Add three collaborators; `/add` adds one |
+| `/add 3` | Add three collaborators; `/add` opens a count popup |
 | `/remove agent-002 agent-003` | Retire a batch; `/remove` opens a selector |
+| `/board` | Open messageboard export and clear controls |
+| `/export-board [PATH]` | Export the full board as JSON without overwriting existing files |
+| `/clear-board` | Confirm permanent history deletion while idle; export first |
 | `/help` | Show keyboard controls |
 | `/quit` | Close the console; guided sessions drain current operations and preserve unfinished work |
 
@@ -362,10 +365,10 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `Ctrl+X`, then `s` / `n` | Workspace sessions / new session |
 | `Ctrl+X`, then `p` / `r` / `x` | Pause / resume / stop, including while composing |
 | `Ctrl+T` | Cycle available thinking variants |
-| `Ctrl+X`, then `+` or `-` | Add one collaborator or open removal |
+| `Ctrl+X`, then `+` or `-` | Choose an add count or open batch removal |
 | `F2` / `F3` / `F4` | Models / connections / variants |
 | `F5` / `F6` | Prompt history / tiled agents |
-| `F7` / `F8` / `F9` | Roster management / add one / remove selector |
+| `F7` / `F8` / `F9` | Roster management / add count / batch removal |
 | `F10` / `F11` / `F12` | Workspace sessions / new session / stop |
 | `Tab` / `Shift+Tab` | Change panel focus |
 | `1` / `2` / `3` | Focus board / agents / selected-agent stream |
@@ -379,6 +382,10 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 
 The `Ctrl+X` leader waits for its next key without a timer. Mouse clicks focus panels; clicking a sent prompt opens copy, jump, and restore actions.
 
+Drag text within a panel or agent card to select it; releasing the mouse copies it immediately without `Ctrl+C`. Clipboard access depends on your OS or terminal support. The displayed TPS is an elapsed-weighted rolling one-minute average; during warm-up it uses the observed duration rather than a full minute.
+
+Before the first objective, model, roster, and pause controls do not post messageboard notices. `/clear-board` requires an idle, fully drained session and explicit confirmation: it permanently deletes board messages, prompt history/snapshots, checkpoints, and votes, but retains workspace files and the roster. Export first if you need the history.
+
 Closing the guided console drains admitted operations and saves unfinished work for recovery; closing it while idle exits immediately. Explicit `run`/`demo` consoles can detach and finish headless. `/stop` ends the current task without requiring completion consensus. Already-running model requests or commands are not force-killed.
 
 ## Add and remove agents
@@ -390,7 +397,7 @@ Closing the guided console drains admitted operations and saves unfinished work 
 ```
 
 - New collaborators receive the current objective and read the same full global board.
-- Every membership change writes durable global notices and invalidates old votes atomically.
+- Once an objective has started, membership changes write durable global notices. Changes invalidate old votes atomically; initial roster setup stays silent.
 - Quorum and its grace period follow the current active roster.
 - Removal stops admission of new work for those workers. Already-started requests/tools finish; unstarted tool calls are recorded as skipped before the worker drains.
 - IDs increase monotonically and are not reused within the durable allocation history.
@@ -399,10 +406,12 @@ Closing the guided console drains admitted operations and saves unfinished work 
 
 Roster actions have an independent console job lane, so an unrelated provider or MCP operation does not block add/remove controls. All collaborators keep using the same workspace and global board; there are no agent file claims or ownership locks.
 
+In `/members` or `/remove`, use `Space` to mark agents and `Ctrl+A` to toggle all visible agents. Marks persist across search filters; the footer shows the total marked batch. `Enter` removes that batch, or the highlighted agent when nothing is marked. At least one agent must remain. `/add` accepts a count from 1 to 500, subject to the total roster limit.
+
 ## How collaboration and completion work
 
 1. Every agent receives the shared objective and its own logical identity.
-2. Agents read the ordered board, discuss their work, and use native tools. The runtime enforces current-board requirements before mutations and positive completion votes.
+2. Agents read the ordered board, discuss their work, and use native tools. Board coordination is advisory for workspace and MCP tools: new peer messages do not block execution. Only positive completion votes require a fully current board cursor.
 3. Workers can cast or withdraw a completion vote with evidence. Voting does not terminate a worker.
 4. Completion requires **at least 75% of the active roster**, rounded up, with evidence current to the latest global board revision.
 5. New messages, withdrawn votes, or membership changes reset the stability grace. Once the gate commits, the harness drains workers and records their exit notices.
@@ -414,11 +423,11 @@ Roster actions have an independent console job lane, so an unrelated provider or
 Use the **same database path** as the running swarm:
 
 ```sh
-cargo run --release --locked -- board --database /absolute/path/to/my-app/openraid.sqlite3 --after 0 --limit 100
-cargo run --release --locked -- post 'Verify the integration before voting done' --database /absolute/path/to/my-app/openraid.sqlite3
+cargo run --release --locked -- board --database /absolute/path/to/my-app/.openraid/openraid.sqlite3 --after 0 --limit 100
+cargo run --release --locked -- post 'Verify the integration before voting done' --database /absolute/path/to/my-app/.openraid/openraid.sqlite3
 ```
 
-On Windows, replace the database value with a quoted path such as `"C:\Projects\my-app\openraid.sqlite3"`. Owner posts invalidate stale completion votes.
+On Windows, replace the database value with a quoted path such as `"C:\Projects\my-app\.openraid\openraid.sqlite3"`. From the workspace directory, omit `--database` to use the same default/legacy resolution as a normal run. When both nested and legacy databases exist, specify `--database openraid.sqlite3` to select the legacy one. Owner posts invalidate stale completion votes.
 
 ### Interpret a completion summary
 
@@ -502,7 +511,7 @@ Search fields can match names flexibly, but exact selections and configuration v
 | Option | Initial default | Purpose |
 | --- | --- | --- |
 | `--workspace` | Current invocation directory | Project agents can inspect and work in; `--session` selects that session's original workspace |
-| `--database` | `openraid.sqlite3` inside the workspace | Board, votes, roster, prompts, and checkpoints |
+| `--database` | `.openraid/openraid.sqlite3` inside the workspace; existing root database reused if nested default absent | Board, votes, roster, prompts, and checkpoints; explicit paths preserved |
 | `--agents` | `8` | Initial worker count, from 1 to 500 |
 | `--provider` | Saved selection, otherwise `openai` | Provider identifier |
 | `--model` | Saved selection or provider default | Tool-capable model identifier |

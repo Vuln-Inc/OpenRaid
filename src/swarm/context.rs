@@ -373,7 +373,10 @@ pub fn swarm_system_prompt(objective: &str, workspace: &str, agents: usize) -> A
          create file claims, establish ownership systems, or lock files for agent coordination. \
          Only board cursor/offset/pagination is allowed. Consult other agents to avoid duplicated \
          work and resolve blockers collaboratively. Owner messages are explicitly marked and \
-         must be recognized as steering the common objective.\n\n\
+         must be recognized as steering the common objective. Board coordination is advisory for \
+         workspace and MCP tools: new messages arriving after a read do not block execution. \
+         Keep making progress while checking updates regularly; only positive completion votes \
+         require a fully current board cursor.\n\n\
          EXECUTION\n\
          Build actual working changes using native tools, inspect the workspace, and verify \
          meaningful functionality. Do not settle for plans. Do not introduce duration-based \
@@ -392,6 +395,18 @@ pub fn swarm_system_prompt(objective: &str, workspace: &str, agents: usize) -> A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordination_prompt_keeps_execution_advisory_and_completion_fresh() {
+        let prompt = swarm_system_prompt("verify changes", "workspace", 8);
+        assert!(prompt.contains(
+            "workspace and MCP tools: new messages arriving after a read do not block execution"
+        ));
+        assert!(
+            prompt.contains("only positive completion votes require a fully current board cursor")
+        );
+        assert!(prompt.contains("Read the shared global board immediately and frequently"));
+    }
 
     fn window() -> ContextWindow {
         ContextWindow::new(

@@ -1,4 +1,6 @@
 //! A live operator console. Board navigation is exclusively global cursor pagination.
+#[path = "selection.rs"]
+mod selection;
 use crate::{
     metrics::{AgentStatus, Metrics, MetricsSnapshot},
     quick::{Entry, ProviderManager},
@@ -36,6 +38,8 @@ use std::{
 use tokio::sync::watch;
 
 const PAGE_SIZE: usize = 100;
+#[path = "tps.rs"]
+mod tps;
 const SLATE: Color = Color::Rgb(21, 38, 56);
 const ICE: Color = Color::Rgb(220, 231, 239);
 const COBALT: Color = Color::Rgb(168, 184, 255);
@@ -75,7 +79,7 @@ const COMMANDS: [(&str, &str, KeyCode); 21] = [
     ("Show tiled agents", "/agents", KeyCode::F(6)),
     ("Manage parallel agents", "/members", KeyCode::F(7)),
     (
-        "Add a parallel agent",
+        "Add parallel agents",
         "Ctrl+X + · /add [count]",
         KeyCode::F(8),
     ),
@@ -127,8 +131,7 @@ struct UiState {
     help: bool,
     notice: String,
     rates: VecDeque<u64>,
-    last_sample: Instant,
-    last_tokens: u64,
+    throughput: tps::Throughput,
     tps: f64,
     session: SessionInfo,
     palette: bool,
@@ -156,6 +159,7 @@ struct UiState {
     workspace: String,
     database: String,
     control_hits: Vec<(Rect, Action)>,
+    selection: selection::Selection,
 }
 
 impl Default for UiState {
@@ -176,8 +180,7 @@ impl Default for UiState {
             help: false,
             notice: String::new(),
             rates: VecDeque::with_capacity(120),
-            last_sample: Instant::now(),
-            last_tokens: 0,
+            throughput: tps::Throughput::default(),
             tps: 0.0,
             session: SessionInfo::default(),
             palette: false,
@@ -205,6 +208,7 @@ impl Default for UiState {
             workspace: String::new(),
             database: String::new(),
             control_hits: Vec::new(),
+            selection: selection::Selection::default(),
         }
     }
 }
@@ -220,15 +224,15 @@ impl UiState {
     }
 
     fn sample(&mut self, snapshot: &MetricsSnapshot) {
-        let elapsed = self.last_sample.elapsed().as_secs_f64();
-        if elapsed >= 1.0 {
-            self.tps = snapshot.output_tokens.saturating_sub(self.last_tokens) as f64 / elapsed;
+        if let Some(rate) = self
+            .throughput
+            .sample(Instant::now(), snapshot.output_tokens)
+        {
+            self.tps = rate;
             self.rates.push_back(self.tps.round() as u64);
             if self.rates.len() > 120 {
                 self.rates.pop_front();
             }
-            self.last_tokens = snapshot.output_tokens;
-            self.last_sample = Instant::now();
         }
     }
 
@@ -263,9 +267,7 @@ impl UiState {
                 KeyCode::Char('p') => self.actions.push_back(Action::Pause),
                 KeyCode::Char('r') => self.actions.push_back(Action::Resume),
                 KeyCode::Char('x') => self.actions.push_back(Action::Stop),
-                KeyCode::Char('+') | KeyCode::Char('=') => {
-                    self.actions.push_back(Action::AddAgents(1))
-                }
+                KeyCode::Char('+') | KeyCode::Char('=') => self.actions.push_back(Action::AddList),
                 KeyCode::Char('-') => self.actions.push_back(Action::RemoveList),
                 _ => {}
             }
@@ -428,7 +430,7 @@ impl UiState {
             KeyCode::F(5) => self.actions.push_back(Action::JumpList),
             KeyCode::F(6) => self.grid = !self.grid,
             KeyCode::F(7) => self.actions.push_back(Action::Members),
-            KeyCode::F(8) => self.actions.push_back(Action::AddAgents(1)),
+            KeyCode::F(8) => self.actions.push_back(Action::AddList),
             KeyCode::F(9) => self.actions.push_back(Action::RemoveList),
             KeyCode::F(10) => self.actions.push_back(Action::Sessions),
             KeyCode::F(11) => self.actions.push_back(Action::NewSession),
@@ -612,6 +614,7 @@ enum JobResult {
     Jumped(u64),
     MembershipChanged(String),
     LifecycleChanged(String),
+    BoardCleared,
     Navigate,
 }
 
@@ -634,14 +637,15 @@ fn roster_entries(kind: &Kind, members: &[String]) -> Vec<Entry> {
     if matches!(kind, Kind::Members) {
         entries.push(Entry {
             id: "add".into(),
-            label: "Add a parallel agent".into(),
-            detail: "Joins the ongoing objective and the same global board".into(),
+            label: "Add parallel agents…".into(),
+            detail: "Choose a batch count; joins the ongoing objective and the same global board"
+                .into(),
         });
     }
     entries.extend(members.iter().map(|id| Entry {
         label: id.clone(),
         id: id.clone(),
-        detail: "Enter to remove gracefully after in-flight operations finish".into(),
+        detail: "Space to mark; Enter removes the batch after in-flight operations finish".into(),
     }));
     entries
 }
@@ -665,6 +669,7 @@ fn refresh_roster_menu(app: &mut UiState, members: &[String]) {
         .get(menu.selected)
         .map(|entry| entry.id.clone());
     menu.entries = roster_entries(&menu.kind, members);
+    menu.marked.retain(|id| members.contains(id));
     menu.selected = selected
         .and_then(|id| menu.filtered().iter().position(|entry| entry.id == id))
         .unwrap_or(0);
@@ -717,6 +722,72 @@ fn refresh_mcp_menu(app: &mut UiState, hub: &crate::mcp::Hub) {
 
 async fn perform(action: Action, manager: ProviderManager, store: Store) -> Result<JobResult> {
     match action {
+        Action::Board => Ok(JobResult::Open(
+            Kind::Board,
+            vec![
+                Entry {
+                    id: "export".into(),
+                    label: "Export complete messageboard".into(),
+                    detail: "Save every message as JSON; /export-board PATH selects a destination"
+                        .into(),
+                },
+                Entry {
+                    id: "clear".into(),
+                    label: "Clear messageboard…".into(),
+                    detail: "Permanent deletion; confirmation required; idle only".into(),
+                },
+            ],
+        )),
+        Action::ConfirmClearBoard => {
+            anyhow::ensure!(
+                !manager.control.is_busy(),
+                "stop work and wait for all workers to drain before clearing the board"
+            );
+            Ok(JobResult::Open(Kind::ClearBoard, vec![
+                Entry { id: "cancel".into(), label: "Cancel — keep history".into(), detail: "Recommended: export the board first".into() },
+                Entry { id: "clear".into(), label: "Permanently delete history".into(), detail: "Deletes all board messages, prompt snapshots, worker checkpoints and votes".into() },
+            ]))
+        }
+        Action::ClearBoard => {
+            manager.control.clear_board().await?;
+            Ok(JobResult::BoardCleared)
+        }
+        Action::ExportBoard(path) => {
+            use tokio::io::AsyncWriteExt;
+            let current = manager.control.current();
+            let path = path.map(std::path::PathBuf::from).unwrap_or_else(|| {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                std::path::PathBuf::from(format!("messageboard-{stamp}.json"))
+            });
+            let path = if path.is_absolute() {
+                path
+            } else {
+                current.config.workspace.join(path)
+            };
+            let messages = store.export_board().await?;
+            let bytes = serde_json::to_vec_pretty(&messages)?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "create board export {} (existing files are not overwritten)",
+                        path.display()
+                    )
+                })?;
+            file.write_all(&bytes).await?;
+            file.flush().await?;
+            Ok(JobResult::LifecycleChanged(format!(
+                "Exported {} messages to {}",
+                messages.len(),
+                path.display()
+            )))
+        }
         Action::Sessions => {
             let current = manager.control.current();
             let database = std::fs::canonicalize(&current.config.database)
@@ -790,6 +861,7 @@ async fn perform(action: Action, manager: ProviderManager, store: Store) -> Resu
             let entries = roster_entries(&kind, &manager.control.members());
             Ok(JobResult::Open(kind, entries))
         }
+        Action::AddList => Ok(JobResult::Open(Kind::AddAgents, Vec::new())),
         Action::AddAgents(count) => {
             let ids = manager.control.add_agents(count).await?;
             Ok(JobResult::MembershipChanged(format!(
@@ -908,6 +980,7 @@ async fn dispatch_roster_actions(
         matches!(
             action,
             Action::Members
+                | Action::AddList
                 | Action::RemoveList
                 | Action::AddAgents(_)
                 | Action::RemoveAgents(_)
@@ -943,7 +1016,7 @@ async fn dispatch_roster_actions(
         }
         if matches!(
             action,
-            Action::Members | Action::RemoveList | Action::Sessions
+            Action::Members | Action::AddList | Action::RemoveList | Action::Sessions
         ) {
             // Local menus cannot wait on the remote discovery/mutation lane.
             // A broken metadata file must not take down the live console.
@@ -1004,6 +1077,9 @@ async fn run_console(
     let mut board_dirty = true;
     let mut job: Option<ConsoleJob> = None;
     let mut roster_jobs = tokio::task::JoinSet::new();
+    let mut clipboard_jobs = tokio::task::JoinSet::new();
+    let mut rendered = ratatui::buffer::Buffer::empty(Rect::default());
+    let mut left_pressed = false;
     let display_result = async {
       loop {
         if *shutdown.borrow() {
@@ -1040,10 +1116,28 @@ async fn run_console(
                 app.selected = app.selected.min(agent_count.saturating_sub(1));
                 app.table.select((agent_count > 0).then_some(app.selected));
                 app.sample(&snapshot);
-                terminal.draw(|frame| draw(frame, &mut app, &snapshot, &metrics))?;
+                terminal.draw(|frame| {
+                    draw(frame, &mut app, &snapshot, &metrics);
+                    rendered = frame.buffer_mut().clone();
+                    if app.menu.is_none() && !app.help && !app.palette {
+                        app.selection.render(frame.buffer_mut());
+                    } else {
+                        app.selection.cancel();
+                    }
+                })?;
             },
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() { break; }
+            },
+            result = clipboard_jobs.join_next(), if !clipboard_jobs.is_empty() => {
+                app.notice = match result {
+                    Some(Ok(Ok(Ok(())))) => "Selection copied to clipboard".into(),
+                    Some(Ok(Ok(Err(error)))) => format!("Clipboard copy failed: {error:#}"),
+                    Some(Ok(Err(_))) => "Clipboard copy timed out".into(),
+                    Some(Err(error)) if error.is_cancelled() => continue,
+                    Some(Err(error)) => format!("Clipboard copy failed: {error}"),
+                    None => String::new(),
+                };
             },
             result = board_changes.changed() => {
                 if result.is_ok() { board_dirty = true; }
@@ -1094,6 +1188,11 @@ async fn run_console(
                     Ok(Ok(JobResult::LifecycleChanged(message))) => {
                         app.notice = message; board_dirty = true;
                     },
+                    Ok(Ok(JobResult::BoardCleared)) => {
+                        app.board.clear(); app.after = 0; app.latest = 0; app.board_scroll = 0;
+                        app.follow = true; app.session.objective.clear(); board_dirty = true;
+                        app.notice = "Messageboard and prompt/checkpoint history cleared. Workspace and roster retained.".into();
+                    },
                     Ok(Ok(JobResult::Navigate)) => break,
                     Ok(Ok(JobResult::Restored(text,snapshot))) => {
                         app.draft = text; app.composing = true;
@@ -1110,6 +1209,8 @@ async fn run_console(
             },
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) => {
+                    left_pressed = false;
+                    app.selection.cancel();
                     match app.key(key, &store, agent_count).await {
                         Ok(true) => break,
                         Ok(false) => {},
@@ -1122,8 +1223,34 @@ async fn run_console(
                 },
                 Some(Ok(Event::Mouse(mouse))) if app.menu.is_none() && !app.help && !app.palette => {
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        left_pressed = false;
+                        app.selection.cancel();
                         if let Some((_,action)) = app.control_hits.iter().find(|(rect,_)| rect.contains((mouse.column,mouse.row).into())) {
                             app.actions.push_back(action.clone());
+                            continue;
+                        }
+                        let point = (mouse.column, mouse.row).into();
+                        let pane = app.grid_hits.iter().map(|(rect, _)| rect).chain(app.panels.iter())
+                            .find(|rect| rect.contains(point));
+                        let area = pane.map(|rect| rect.inner(ratatui::layout::Margin::new(1, 1)))
+                            .unwrap_or(rendered.area);
+                        app.selection.start(&rendered, area, point);
+                        left_pressed = true;
+                    }
+                    if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
+                        app.selection.update((mouse.column, mouse.row).into());
+                        continue;
+                    }
+                    if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+                        if !left_pressed { continue; }
+                        left_pressed = false;
+                        if let Some(text) = app.selection.finish((mouse.column, mouse.row).into()) {
+                            if !text.is_empty() {
+                                clipboard_jobs.abort_all();
+                                clipboard_jobs.spawn(async move {
+                                    tokio::time::timeout(Duration::from_secs(3), crate::clipboard::copy(&text)).await
+                                });
+                            }
                             continue;
                         }
                         if let Some((_,seq)) = app.prompt_hits.iter().find(|(rect,_)| rect.contains((mouse.column,mouse.row).into())) {
@@ -1148,7 +1275,10 @@ async fn run_console(
                         _ => {},
                     }
                 },
-                Some(Ok(Event::Resize(_, _))) => {},
+                Some(Ok(Event::Resize(_, _))) => {
+                    left_pressed = false;
+                    app.selection.cancel();
+                },
                 Some(Ok(_)) => {},
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
@@ -1353,7 +1483,10 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
             app.current_votes.unwrap_or(snapshot.voted),
             threshold
         )),
-        Span::styled(format!("{:.1} tps  ", app.tps), Style::default().fg(AMBER)),
+        Span::styled(
+            format!("{:.1} tps (1m)  ", app.tps),
+            Style::default().fg(AMBER),
+        ),
         Span::raw(format!(
             "{:02}:{:02}:{:02}",
             uptime / 3600,
@@ -1507,7 +1640,7 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                 .data(&rates)
                 .style(Style::default().fg(COBALT))
                 .block(block(
-                    format!(" output tokens / second  {:.1}", app.tps),
+                    format!(" output tokens / second (1m avg)  {:.1}", app.tps),
                     false,
                 )),
             rows[3],
@@ -1866,8 +1999,9 @@ fn draw_help(frame: &mut Frame<'_>) {
          /remove [IDs]     remove a batch, or open the graceful-remove menu\n\
          Ctrl+X then M/C/T models / connect / variants (no time limit)\n\
          Ctrl+X then J/A   prompt history / agent grid\n\
-         Ctrl+X then +/-   add one agent / choose an agent to remove\n\
+         Ctrl+X then +/-   choose add count / mark agents to remove\n\
          click a prompt    copy / restore prompt and workspace / jump\n\
+         drag text         copy selection immediately on release\n\
          Ctrl+P            command palette; Esc closes overlays\n\
          Tab / Shift+Tab   focus board / agents / stream\n\
          ↑/↓ or j/k        navigate focused panel\n\
@@ -2310,7 +2444,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
     }
 
     #[tokio::test]
-    async fn managed_membership_actions_update_roster_and_record_notices_without_prompt_submission(
+    async fn managed_membership_actions_update_roster_silently_before_prompt_submission(
     ) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let harness = crate::runtime::Harness::new(crate::config::Config {
@@ -2360,9 +2494,10 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
         assert_eq!(store.latest_seq().await?, before);
         assert!(store.prompts().await?.is_empty());
         let reopened = Store::open(directory.path().join("menu.sqlite")).await?;
+        assert_eq!(reopened.membership().await?.agent_ids.len(), 3);
         assert!(
-            reopened.read_board(0, 100).await?.len() >= 3,
-            "add/remove controls leave durable shared-board notices"
+            reopened.read_board(0, 100).await?.is_empty(),
+            "pre-objective add/remove controls do not post shared-board notices"
         );
         Ok(())
     }
@@ -2392,7 +2527,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
             .await?;
             assert!(matches!(
                 (app.actions.pop_front(), add),
-                (Some(Action::AddAgents(1)), true) | (Some(Action::RemoveList), false)
+                (Some(Action::AddList), true) | (Some(Action::RemoveList), false)
             ));
             assert_eq!(app.draft, "unfinished owner instruction");
         }
@@ -2423,7 +2558,7 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
         menu.paste("add");
         assert!(matches!(
             menu.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Outcome::Action(Action::AddAgents(1))
+            Outcome::Action(Action::AddList)
         ));
         menu.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(

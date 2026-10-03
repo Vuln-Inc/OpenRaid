@@ -5,6 +5,190 @@ fn command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_openraid"))
 }
 
+fn isolated_workspace_command(workspace: &std::path::Path) -> Command {
+    let mut cmd = command();
+    cmd.current_dir(workspace)
+        .env("OPENRAID_AUTH_FILE", workspace.join("auth.json"))
+        .env("XDG_CONFIG_HOME", workspace.join("config"))
+        .env("XDG_DATA_HOME", workspace.join("data"));
+    cmd
+}
+
+fn demo_in_workspace(workspace: &std::path::Path, database: Option<&std::path::Path>) {
+    let mut cmd = isolated_workspace_command(workspace);
+    cmd.args(["demo", "--agents", "1", "--no-tui", "--grace-secs", "0"]);
+    if let Some(database) = database {
+        cmd.arg("--database").arg(database);
+    }
+    assert!(successful_json(cmd.output().unwrap()).is_object());
+}
+
+#[test]
+fn default_database_and_owner_commands_share_workspace_storage_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path();
+    demo_in_workspace(workspace, None);
+    let database = workspace.join(".openraid/openraid.sqlite3");
+    assert!(database.is_file());
+    for name in [
+        "openraid.sqlite3",
+        "openraid.sqlite3-wal",
+        "openraid.sqlite3-shm",
+    ] {
+        assert!(
+            !workspace.join(name).exists(),
+            "unexpected root file {name}"
+        );
+    }
+    let injected = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["post", "nested default owner message"])
+            .output()
+            .unwrap(),
+    );
+    demo_in_workspace(workspace, None);
+    let board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--limit", "500"])
+            .output()
+            .unwrap(),
+    );
+    assert!(board.as_array().unwrap().contains(&injected));
+    let explicit_board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--limit", "500", "--database"])
+            .arg(&database)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        board, explicit_board,
+        "owner commands must use the session DB"
+    );
+    for name in [
+        "openraid.sqlite3",
+        "openraid.sqlite3-wal",
+        "openraid.sqlite3-shm",
+    ] {
+        assert!(
+            !workspace.join(name).exists(),
+            "unexpected root file {name}"
+        );
+    }
+    let sessions = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["sessions", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+    assert_eq!(
+        std::path::PathBuf::from(sessions[0]["database"].as_str().unwrap()),
+        std::fs::canonicalize(database).unwrap()
+    );
+}
+
+#[test]
+fn legacy_root_database_remains_accessible_to_default_launch_and_owner_commands() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path();
+    let legacy = workspace.join("openraid.sqlite3");
+    demo_in_workspace(workspace, Some(&legacy));
+    let injected = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["post", "legacy database owner message"])
+            .output()
+            .unwrap(),
+    );
+    demo_in_workspace(workspace, None);
+    let board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--limit", "500"])
+            .output()
+            .unwrap(),
+    );
+    assert!(board.as_array().unwrap().contains(&injected));
+    assert!(!workspace.join(".openraid/openraid.sqlite3").exists());
+    let sessions = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["sessions", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(sessions.as_array().unwrap().len(), 1);
+    assert_eq!(
+        std::path::PathBuf::from(sessions[0]["database"].as_str().unwrap()),
+        std::fs::canonicalize(legacy).unwrap()
+    );
+}
+
+#[test]
+fn explicit_database_path_is_not_replaced_by_workspace_default() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path();
+    let custom = std::path::Path::new("custom/history.sqlite3");
+    demo_in_workspace(workspace, Some(custom));
+    assert!(workspace.join(custom).is_file());
+    assert!(!workspace.join(".openraid/openraid.sqlite3").exists());
+    let injected = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["post", "explicit database owner message", "--database"])
+            .arg(custom)
+            .output()
+            .unwrap(),
+    );
+    let board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--database"])
+            .arg(custom)
+            .output()
+            .unwrap(),
+    );
+    assert!(board.as_array().unwrap().contains(&injected));
+}
+
+#[test]
+fn owner_commands_prefer_nested_database_without_hiding_explicit_legacy_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path();
+    demo_in_workspace(workspace, None);
+    let legacy = std::path::Path::new("openraid.sqlite3");
+    demo_in_workspace(workspace, Some(legacy));
+    let nested_message = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["post", "prefer nested when both databases exist"])
+            .output()
+            .unwrap(),
+    );
+    let default_board = successful_json(
+        isolated_workspace_command(workspace)
+            .arg("board")
+            .output()
+            .unwrap(),
+    );
+    assert!(default_board.as_array().unwrap().contains(&nested_message));
+    let explicit_nested_board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--database", ".openraid/openraid.sqlite3"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(default_board, explicit_nested_board);
+    let legacy_board = successful_json(
+        isolated_workspace_command(workspace)
+            .args(["board", "--database"])
+            .arg(legacy)
+            .output()
+            .unwrap(),
+    );
+    assert!(!legacy_board
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| { entry["body"] == "prefer nested when both databases exist" }));
+    assert!(workspace.join(legacy).is_file());
+}
+
 fn successful_json(output: Output) -> Value {
     assert!(
         output.status.success(),

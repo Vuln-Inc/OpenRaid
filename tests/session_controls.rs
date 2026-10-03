@@ -369,8 +369,8 @@ async fn pause_drains_inflight_protocol_group_and_resume_uses_preserved_history(
         json!({"body":"in-flight group completed while paused"}),
     )
     .await?;
-    // A pause notice makes the pending mutating tool stale. Either a durable
-    // result or rejection is preserved; the worker must not issue another turn.
+    // A pause notice does not block already-admitted tools. Their durable
+    // results are preserved; the worker must not issue another turn while paused.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if store

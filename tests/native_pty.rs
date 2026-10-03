@@ -209,11 +209,15 @@ async fn real_terminal_interaction_resize_full_disk_output_and_natural_exit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_registry_capacity_explicit_kill_and_fresh_board_enforcement() {
+async fn shared_registry_capacity_explicit_kill_and_advisory_board() {
     let root = tempfile::tempdir().unwrap();
     let store = Store::open(root.path().join("swarm.sqlite")).await.unwrap();
     let workspace = WorkspaceTools::new(root.path(), 1).unwrap();
     let bus = ToolBus::new(store.clone(), workspace.clone());
+    store
+        .append("owner", "coordinate before acting", true)
+        .await
+        .unwrap();
     let child = bus
         .execute("agent-001", "pty_spawn", &child_args())
         .await
@@ -243,17 +247,29 @@ async fn shared_registry_capacity_explicit_kill_and_fresh_board_enforcement() {
         .append("owner", "coordinate before acting", true)
         .await
         .unwrap();
+    bus.execute(
+        "agent-002",
+        "pty_write",
+        &json!({"id":id,"data":"stale\r\n"}),
+    )
+    .await
+    .unwrap();
+    read_until(&workspace, id, "PTY_REPLY:stale").await;
+    bus.execute(
+        "agent-002",
+        "pty_resize",
+        &json!({"id":id,"rows":25,"cols":100}),
+    )
+    .await
+    .unwrap();
     assert!(bus
         .execute(
             "agent-002",
-            "pty_write",
-            &json!({"id":id,"data":"stale\r\n"})
+            "vote_done",
+            &json!({"done":true,"evidence":"PTY operations succeeded"})
         )
         .await
         .is_err());
-    bus.execute("agent-002", "board_read", &json!({}))
-        .await
-        .unwrap();
     let killed = bus
         .execute("agent-002", "pty_kill", &json!({"id":id}))
         .await

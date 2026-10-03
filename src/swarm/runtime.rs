@@ -787,7 +787,7 @@ async fn live_worker(
                 // signatures or encrypted reasoning into a new connection.
                 context.reconfigure(context_config(&initial.config));
                 // The checkpoint cursor records already-delivered contiguous
-                // history; restore native-tool freshness even if no new page exists.
+                // history; restore completion-vote freshness even if no new page exists.
                 shared.tools.observe_board(id, cursor);
             }
         }
@@ -999,7 +999,8 @@ async fn drain_board(
     cursor: &mut u64,
 ) -> Result<bool> {
     // Snapshot the catch-up boundary so a continuously active swarm cannot starve
-    // a worker inside one unbounded read loop. Future entries remain unread/freshness-gated.
+    // a worker inside one unbounded read loop. Future entries remain unread and
+    // prevent positive completion votes, but do not block workspace/MCP tools.
     let stop_at = shared.store.latest_seq().await?;
     loop {
         let page = shared.store.read_board(*cursor, 8).await?;

@@ -422,7 +422,8 @@ impl Store {
             }
             transaction.execute("UPDATE membership_state SET revision=revision+1 WHERE singleton=1", [])?;
             transaction.execute("DELETE FROM votes", [])?;
-            for body in notices {
+            let started: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM prompts)", [], |row| row.get(0))?;
+            for body in notices.into_iter().filter(|_| started) {
                 transaction.execute(
                     "INSERT INTO board(sender,body,owner,created_at_ms) VALUES ('owner-control',?1,1,?2)",
                     params![body, timestamp_ms()],
@@ -650,6 +651,50 @@ impl Store {
 
     pub async fn latest_seq(&self) -> Result<u64> {
         self.call(|connection| latest_cursor(connection)).await
+    }
+
+    /// An atomic, unpaginated snapshot for operator export.
+    pub async fn export_board(&self) -> Result<Vec<BoardMessage>> {
+        self.call(|connection| {
+            let mut query = connection
+                .prepare("SELECT seq,sender,body,owner,created_at_ms FROM board ORDER BY seq")?;
+            let rows = query
+                .query_map([], |row| {
+                    Ok(BoardMessage {
+                        seq: row.get(0)?,
+                        sender: row.get(1)?,
+                        body: row.get(2)?,
+                        owner: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Only an idle operator control may call this. Retain AUTOINCREMENT state
+    /// so existing runtime cursors still see subsequent prompts.
+    pub(crate) async fn clear_board(&self) -> Result<()> {
+        let revision = self.revision.clone();
+        self.call(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let workers: usize = transaction.query_row("SELECT COUNT(*) FROM worker_slots", [], |row| row.get(0))?;
+            ensure!(workers == 0, "wait for all workers to drain before clearing the board");
+            transaction.execute_batch("DELETE FROM votes; DELETE FROM checkpoints; DELETE FROM prompts; DELETE FROM board;")?;
+            transaction.commit()?;
+            revision.send_replace(0);
+            Ok(())
+        }).await
+    }
+
+    pub async fn has_started(&self) -> Result<bool> {
+        self.call(|connection| {
+            Ok(connection
+                .query_row("SELECT EXISTS(SELECT 1 FROM prompts)", [], |row| row.get(0))?)
+        })
+        .await
     }
 
     /// One supervisor can poll cross-process changes and wake all local agents.
@@ -1038,6 +1083,9 @@ mod tests {
         let path = directory.path().join("coherent-roster.sqlite");
         let reader = Store::open(&path).await?;
         reader.initialize_membership(1, false).await?;
+        let objective = reader
+            .append("owner", "exercise concurrent membership", true)
+            .await?;
         let writer = Store::open(&path).await?;
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_done = done.clone();
@@ -1080,7 +1128,7 @@ mod tests {
         };
         tokio::try_join!(writes, reads)?;
         assert_eq!(reader.membership().await?.revision, 2_000);
-        assert_eq!(reader.read_board(0, 10_000).await?.len(), 2_000);
+        assert_eq!(reader.read_board(objective.seq, 10_000).await?.len(), 2_000);
         Ok(())
     }
 
@@ -1232,6 +1280,9 @@ mod tests {
         let path = directory.path().join("membership.sqlite");
         let store = Store::open(&path).await?;
         let initial = store.initialize_membership(2, false).await?;
+        let objective = store
+            .append("owner", "exercise parallel membership", true)
+            .await?;
         let external = Store::open(&path).await?;
         let (shutdown, _) = watch::channel(false);
         store
@@ -1255,14 +1306,14 @@ mod tests {
         assert_eq!(joined.agent_ids.len(), 14);
         assert_eq!(joined.agent_ids.last().unwrap(), "agent-014");
         assert!(store.votes().await?.is_empty());
-        let notices = external.read_board(0, 100).await?;
+        let notices = external.read_board(objective.seq, 100).await?;
         assert_eq!(notices.len(), 12);
         assert!(notices
             .iter()
             .all(|notice| notice.owner && notice.sender == "owner-control"));
         assert!(
-            store.prompts().await?.is_empty(),
-            "membership notices are not user tasks"
+            store.prompts().await?.len() == 1,
+            "membership notices do not create additional user tasks"
         );
 
         let mut removals = tokio::task::JoinSet::new();
@@ -1277,7 +1328,7 @@ mod tests {
         let remaining = store.membership().await?;
         assert_eq!(remaining.agent_ids, initial.agent_ids);
         assert_eq!(remaining.revision, initial.revision + 24);
-        assert_eq!(store.read_board(0, 100).await?.len(), 24);
+        assert_eq!(store.read_board(objective.seq, 100).await?.len(), 24);
         assert!(store
             .set_vote("agent-014", true, "retired stale vote")
             .await
@@ -1394,6 +1445,9 @@ mod tests {
     ) -> Result<()> {
         let store = Store::open(":memory:").await?;
         store.initialize_membership(1, false).await?;
+        let objective = store
+            .append("owner", "exercise cancelled membership caller", true)
+            .await?;
         let (started_tx, started_rx) = oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let blocked = store.clone();
@@ -1430,7 +1484,7 @@ mod tests {
         let membership = store.membership().await?;
         assert_eq!(membership.agent_ids, ["agent-001", "agent-002"]);
         assert_eq!(*roster.borrow(), Some(membership));
-        assert!(store.read_board(0, 10).await?[0]
+        assert!(store.read_board(objective.seq, 10).await?[0]
             .body
             .contains("Owner added agent-002"));
         Ok(())
@@ -1508,7 +1562,11 @@ mod tests {
             .add_members(1, independent.subscribe(), |_| {})
             .await?;
         assert_eq!(next.agent_ids.last().unwrap(), "agent-003");
-        assert_eq!(external.latest_seq().await?, 2);
+        assert_eq!(
+            external.latest_seq().await?,
+            1,
+            "membership stays silent without an owner objective"
+        );
         store.close_session().await?;
         assert!(external
             .add_members(1, independent.subscribe(), |_| {})
@@ -1519,7 +1577,7 @@ mod tests {
             .await
             .is_err());
         assert_eq!(external.membership().await?, next);
-        assert_eq!(external.latest_seq().await?, 2);
+        assert_eq!(external.latest_seq().await?, 1);
         Ok(())
     }
 
