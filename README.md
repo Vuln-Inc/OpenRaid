@@ -7,10 +7,10 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.0.0-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.0.0)
+[![Version](https://img.shields.io/badge/version-1.0.1-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.0.1)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
-[![Verification](https://img.shields.io/badge/verified-208%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
+[![Verification](https://img.shields.io/badge/verified-224%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
 [**Quick start**](#install-and-launch) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
@@ -131,18 +131,18 @@ The launch scripts build the optimized executable as needed and open `setup` whe
 bash run.sh demo --agents 4 --no-tui
 ```
 
-Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build script can also be used with a native macOS Rust toolchain. Scripts work when invoked by their path from another directory, but run Cargo from the OpenRaid checkout. **Use `--workspace` to select the project agents should work on.**
+Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build script can also be used with a native macOS Rust toolchain. Launch scripts preserve the directory you invoke them from as the project workspace, using the checkout's Cargo manifest without changing directories. **Use `--workspace` to select a different project explicitly.**
 
 ### Use a standalone executable
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.0.0 archive |
+| Platform | v1.0.1 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.0.0-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.0.0-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.0.0-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.0.0-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.0.1-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.0.1-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.0.1-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.0.1-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
 
@@ -195,9 +195,31 @@ The elapsed time varies. The default five-second consensus grace contributes to 
 
    > Implement pagination for the existing catalog endpoint. Read the current API and tests first, discuss the work on the shared board, preserve the public response format, and verify the implementation before voting done.
 
-After the task reaches consensus and drains, the guided console stays open for another prompt. Later `setup` launches reopen remembered completed work at an idle home. If the remembered database contains unfinished work from an interruption, setup resumes that task, its durable roster, and checkpoints automatically.
+After the task reaches consensus and drains, the guided console stays open for another prompt. Later `setup` launches reopen the most recently used session **in the current workspace** at an idle home. If that session contains unfinished work from an interruption or console close, setup resumes its task, durable roster, and checkpoints. Explicitly stopped work stays stopped.
 
 Use `run --select` when you want the full guided selection flow again. Explicit `run` and `demo` commands finish after their round drains.
+
+### Start, stop, and switch sessions
+
+The console always shows the workspace, session identity, and **IDLE / RUNNING / PAUSED / STOPPING** state. Click the **Sessions**, **New**, **Start**, **Pause / Resume**, and **Stop** controls at the bottom, or use the corresponding slash commands:
+
+- **Start:** enter an objective in the prompt editor, or use `/start your objective`.
+- **Pause / resume:** `/pause` lets admitted operations finish and parks workers at safe boundaries; `/resume` continues with the same history and checkpoints.
+- **Stop:** `/stop` prevents further operations, drains admitted work, and returns the guided console to idle. It does not claim successful completion or automatically replay the stopped task next time.
+- **New:** `/new` creates separate board/history in the same workspace. Stop active work and wait for idle before switching.
+- **History / switch:** `/sessions` lists this workspace's sessions. Select one to open it; `/session ID` also accepts an ID from another workspace.
+
+From another terminal:
+
+```sh
+openraid setup --new                  # fresh session in this directory
+openraid sessions                    # this directory's history
+openraid sessions --all              # sessions across workspaces
+openraid sessions --json             # machine-readable IDs and paths
+openraid setup --session SESSION_ID   # reopen its original workspace explicitly
+```
+
+The first session uses `openraid.sqlite3` in the workspace. New sessions use separate databases under `.openraid/sessions/`. Session metadata is kept alongside OpenRaid's credential/preferences file and contains IDs, titles, workspace paths, and database paths. Existing databases and board history are retained.
 
 ### Run explicitly from the command line
 
@@ -309,6 +331,12 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 
 | Command | Action |
 | --- | --- |
+| `/sessions` | Browse and switch sessions in the current workspace while idle |
+| `/session ID` | Open a saved session, including one from a different workspace |
+| `/new` | Create a separate session with fresh history while idle |
+| `/start [objective]` | Start work, or open the prompt editor |
+| `/pause` / `/resume` | Pause at safe boundaries / continue the same task |
+| `/stop` | Drain current work and return the guided console to idle |
 | `/models` or `/model` | Choose a tool-capable model from connected providers |
 | `/models openai/gpt-4.1-mini` | Select an exact qualified provider/model ID |
 | `/connect` | Connect a provider; enter a custom endpoint when one is missing |
@@ -321,7 +349,7 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `/add 3` | Add three collaborators; `/add` adds one |
 | `/remove agent-002 agent-003` | Retire a batch; `/remove` opens a selector |
 | `/help` | Show keyboard controls |
-| `/quit` | Close the console; active work drains through native consensus |
+| `/quit` | Close the console; guided sessions drain current operations and preserve unfinished work |
 
 ### Keyboard and mouse
 
@@ -331,11 +359,14 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `Enter` / `Shift+Enter` | Send the prompt / insert a newline while composing |
 | `Esc` | Close an overlay or leave composition; the draft is preserved |
 | `Ctrl+X`, then `m`, `c`, or `t` | Models, connections, or thinking variants |
+| `Ctrl+X`, then `s` / `n` | Workspace sessions / new session |
+| `Ctrl+X`, then `p` / `r` / `x` | Pause / resume / stop, including while composing |
 | `Ctrl+T` | Cycle available thinking variants |
 | `Ctrl+X`, then `+` or `-` | Add one collaborator or open removal |
 | `F2` / `F3` / `F4` | Models / connections / variants |
 | `F5` / `F6` | Prompt history / tiled agents |
 | `F7` / `F8` / `F9` | Roster management / add one / remove selector |
+| `F10` / `F11` / `F12` | Workspace sessions / new session / stop |
 | `Tab` / `Shift+Tab` | Change panel focus |
 | `1` / `2` / `3` | Focus board / agents / selected-agent stream |
 | Arrow keys or `j` / `k` | Navigate the focused panel outside text entry |
@@ -348,7 +379,7 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 
 The `Ctrl+X` leader waits for its next key without a timer. Mouse clicks focus panels; clicking a sent prompt opens copy, jump, and restore actions.
 
-Closing a console with active work lets the swarm finish headless. Closing an idle persistent console ends the session. It does not mean that an already-running model request or command is force-killed.
+Closing the guided console drains admitted operations and saves unfinished work for recovery; closing it while idle exits immediately. Explicit `run`/`demo` consoles can detach and finish headless. `/stop` ends the current task without requiring completion consensus. Already-running model requests or commands are not force-killed.
 
 ## Add and remove agents
 
@@ -470,7 +501,7 @@ Search fields can match names flexibly, but exact selections and configuration v
 
 | Option | Initial default | Purpose |
 | --- | --- | --- |
-| `--workspace` | Current directory, or remembered setup workspace | Project agents can inspect and work in |
+| `--workspace` | Current invocation directory | Project agents can inspect and work in; `--session` selects that session's original workspace |
 | `--database` | `openraid.sqlite3` inside the workspace | Board, votes, roster, prompts, and checkpoints |
 | `--agents` | `8` | Initial worker count, from 1 to 500 |
 | `--provider` | Saved selection, otherwise `openai` | Provider identifier |
@@ -487,6 +518,8 @@ Search fields can match names flexibly, but exact selections and configuration v
 | `--provider-options` | `{}` | JSON provider/generation options |
 | `--header` | None | Repeatable `NAME=VALUE` HTTP header |
 | `--resume` | Off | Restore interrupted durable roster and context on an explicit run |
+| `--new` | Off | Create separate history in this workspace; conflicts with `--resume`, `--session`, and `--database` |
+| `--session ID` | None | Open a cataloged session and its original workspace explicitly |
 | `--select` | Off | Open the guided selection flow |
 | `--no-tui` | Off | Headless execution; also automatic without interactive stdin/stdout |
 
@@ -552,10 +585,10 @@ The SQLite database stores the global board, prompts, active roster, votes, and 
 - An unexpected exit of an active worker restarts the **same logical identity** from its checkpoint and writes a recovery notice.
 - Removed workers remain retired. Workers finishing a committed consensus round do not restart.
 - `run … --resume` restores an interrupted durable session explicitly.
-- Remembered `setup` detects unfinished work automatically; completed historical prompts stay audit-only.
+- `setup` detects unfinished work in the selected workspace session automatically; completed and explicitly stopped prompts stay audit-only.
 - Pending tool groups are repaired without blindly replaying a command whose result was not durably recorded.
 
-Credentials/preferences are stored in `openraid/auth.json` under `XDG_DATA_HOME`, or `~/.local/share` when unset. `OPENRAID_AUTH_FILE` overrides that file. The launch profile remembers settings rather than storing the previous objective or a session-only API key. OpenCode fallback credentials are read from the corresponding `opencode/auth.json`.
+Credentials/preferences are stored in `openraid/auth.json` under `XDG_DATA_HOME`, or `~/.local/share` when unset. `OPENRAID_AUTH_FILE` overrides that file. Launch profiles remember each workspace/session's model and settings rather than storing the previous objective or a session-only API key. Session metadata is stored in a sibling `sessions/` directory. OpenCode fallback credentials are read from the corresponding `opencode/auth.json`.
 
 ### Restore a prompt
 
@@ -572,7 +605,7 @@ Checkpoint recovery does not make arbitrary filesystem or subprocess effects exa
 | `cargo` is unavailable | Install Rust, reopen the terminal, and verify `cargo --version`; scripts also check the home Cargo directory |
 | Windows linker/build failure | Install the Visual Studio C++ build tools for the Rust MSVC toolchain |
 | Setup reports no interactive terminal | Run in a real terminal, or use explicit `run` flags and `--no-tui` |
-| Wrong project is being edited | Pass `--workspace`; launch scripts run from the OpenRaid checkout |
+| Wrong project is being edited | Check the visible `cwd`; launches use the invocation directory unless `--workspace` or `--session` explicitly selects another project |
 | Provider does not appear in `/models` | Connect it first, verify credentials, and choose a tool-capable model |
 | HTTP 401 / 403 | Check the selected account/key and the provider's model permissions |
 | SDK sidecar/module error | Use Node.js 22.12+, run `npm ci --prefix scripts`, or set the correct external sidecar directory |
@@ -592,7 +625,7 @@ The recorded acceptance gate includes:
 
 | Check | Recorded result |
 | --- | --- |
-| Rust, including optional integration fixtures | **208 passed**, none failed or ignored |
+| Rust, including optional integration fixtures | **224 passed**, none failed or ignored |
 | Node SDK/transport/discovery tests | **24 passed** |
 | Native PTY tests | **8 Windows ConPTY cases; 9 Unix cases** |
 | OpenCode source audit | **23 custom loaders and 24 upstream adapter entries** accounted for |

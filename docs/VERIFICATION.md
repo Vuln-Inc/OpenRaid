@@ -1,6 +1,52 @@
 # Verification record
 
-## Current acceptance gate — final source
+## Session controls and directory isolation — issue #4
+
+The final v1.0.1 session-control update was verified on **2026-10-03** using native
+Windows and Linux under WSL, Rust/Cargo 1.99.0 and Node.js 22.14.0 for optional
+Linux Rust fixtures. The separate Node provider/transport suite ran with the host
+Node installation.
+
+| Check | Result |
+| --- | --- |
+| Windows `cargo test --locked --all-targets -- --include-ignored` | **223 passed, 0 failed, 0 ignored**: 136 library, 18 CLI-configuration, 69 integration |
+| Linux `cargo test --locked --all-targets -- --include-ignored` | **224 passed, 0 failed, 0 ignored**: 136 library, 18 CLI-configuration, 70 integration |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed, warning-free |
+| Node SDK/provider-loader/HTTP-transport suite | **24 passed** |
+| `git diff --check` and `bash -n run.sh` | Passed |
+
+Coverage includes invocation-directory scoping, fresh databases, local/all-workspace
+session listing, explicit cross-workspace IDs, conflicting flags, canonical
+database aliases, and separate saved model settings for older sessions. Real
+provider fixtures verify pause/resume history preservation, draining an admitted
+request, skipping unstarted side effects on stop, reusable idle consoles, and
+unfinished-task recovery after closing. Startup/queued-prompt and snapshot/control
+races have dedicated regressions. Terminal tests cover commands, editing shortcuts,
+clickable controls, compact layouts, visible cwd/session/status, and lifecycle
+actions while an unrelated mutation is pending.
+
+A direct walkthrough against the final binary used a real Unix terminal and
+held local HTTP provider requests. It verified visible workspace/session/buttons,
+`/start`, pause during an admitted request, resume with preserved tool history,
+STOPPING while the next request was held, clean drain with its unstarted file
+mutation skipped, `/new`, the workspace session chooser, switching back without
+replaying the explicitly stopped task, and clean console exit. Fixture processes,
+HTTP sockets, and terminal handles were closed afterward.
+
+Final review also serialized queued-round admission with operator stop, preventing
+startup from clearing an already-acknowledged stop between selecting a prompt and
+admitting its workers. The snapshot/control regression verifies that late admission
+preserves the stop signal.
+
+The held-MCP initialization regression now waits for its explicit request-start
+barrier before allowing a fast offline round to reach consensus; it retains the
+worker-collaboration and final transport-shutdown assertions.
+
+The earlier release/build/launcher and provider-source audits below are historical
+platform evidence; the final issue-fix Rust gates above ran on both Windows and Linux.
+
+## Previous native release acceptance gate
 
 The current checklist includes the provider-loader behavioral audit, domain-folder
 reorganization, MCP integration, branding/default endpoints, persistent-console

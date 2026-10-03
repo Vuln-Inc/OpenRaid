@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if command -v cargo >/dev/null 2>&1; then
     cargo_bin=cargo
@@ -18,4 +18,4 @@ if [[ $# -eq 0 ]]; then
     set -- setup
 fi
 
-exec "$cargo_bin" run --release --locked -- "$@"
+exec "$cargo_bin" run --manifest-path "$project_dir/Cargo.toml" --release --locked -- "$@"

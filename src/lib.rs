@@ -37,6 +37,8 @@ pub mod runtime;
 pub mod sdk_bridge;
 #[path = "swarm/session.rs"]
 pub mod session;
+#[path = "persistence/session_catalog.rs"]
+pub mod session_catalog;
 #[path = "terminal/setup.rs"]
 pub mod setup;
 #[path = "persistence/snapshots.rs"]

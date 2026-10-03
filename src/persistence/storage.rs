@@ -298,6 +298,30 @@ impl Store {
         self.set_membership_phase(true).await
     }
 
+    /// Commit an operator drain before publishing the shutdown signal. The
+    /// durable phase prevents independent handles from admitting more workers.
+    pub async fn drain_round(
+        &self,
+        body: String,
+        publish: impl FnOnce(u64) + Send + 'static,
+    ) -> Result<u64> {
+        let revision = self.revision.clone();
+        self.call(move |connection| {
+            let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("UPDATE membership_phase SET draining=1 WHERE singleton=1", [])?;
+            transaction.execute("DELETE FROM votes", [])?;
+            transaction.execute(
+                "INSERT INTO board(sender,body,owner,created_at_ms) VALUES ('owner-control',?1,1,?2)",
+                params![body, timestamp_ms()],
+            )?;
+            let seq = latest_cursor(&transaction)?;
+            transaction.commit()?;
+            publish(seq);
+            revision.send_replace(seq);
+            Ok(seq)
+        }).await
+    }
+
     async fn set_membership_phase(&self, draining: bool) -> Result<()> {
         self.call(move |connection| {
             let transaction =
@@ -526,7 +550,7 @@ impl Store {
             Ok(connection
                 .query_row(
                     "SELECT seq,sender,body,owner,created_at_ms FROM board
-                 WHERE owner=1 AND sender='owner' AND seq > COALESCE((
+                 WHERE owner=1 AND sender='owner' AND seq > MAX(COALESCE((
                      SELECT COALESCE((
                          SELECT MAX(gate.seq) FROM board gate
                          WHERE gate.sender='harness'
@@ -541,7 +565,20 @@ impl Store {
                      ), drained.seq) FROM board drained
                      WHERE drained.sender='harness' AND drained.body='all workers drained; swarm complete'
                      ORDER BY drained.seq DESC LIMIT 1
-                 ),0) ORDER BY seq DESC LIMIT 1",
+                  ),0), COALESCE((
+                      SELECT MAX(stopped.seq) FROM board stopped
+                      WHERE stopped.sender='owner-control'
+                        AND stopped.body='Owner stopped current work; draining in-flight operations.'
+                        AND EXISTS(SELECT 1 FROM board drained
+                            WHERE drained.sender='harness'
+                              AND drained.body='all workers drained; work stopped'
+                              AND drained.seq > stopped.seq
+                              AND NOT EXISTS(SELECT 1 FROM board later
+                                  WHERE later.sender='owner-control'
+                                    AND later.body IN ('Owner stopped current work; draining in-flight operations.',
+                                                       'Owner closed session; draining in-flight operations.')
+                                    AND later.seq > stopped.seq AND later.seq < drained.seq))
+                  ),0)) ORDER BY seq DESC LIMIT 1",
                     [],
                     |row| {
                         Ok(BoardMessage {
@@ -1132,6 +1169,58 @@ mod tests {
             reopened.unfinished_prompt().await?,
             None,
             "a legacy completed round cannot inherit an older round's consensus gate"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operator_stop_requires_drain_and_preserves_later_queued_prompts() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("stopped.sqlite3");
+        let store = Store::open(&path).await?;
+        store.initialize_membership(1, false).await?;
+        let first = store.append("owner", "task stopped by owner", true).await?;
+        store
+            .drain_round(
+                "Owner stopped current work; draining in-flight operations.".into(),
+                |_| {},
+            )
+            .await?;
+        assert_eq!(
+            store.unfinished_prompt().await?,
+            Some(first),
+            "interrupted draining is still recoverable"
+        );
+        let external = Store::open(&path).await?;
+        assert!(
+            !external.mark_worker_started("agent-001").await?,
+            "durable stop prevents independent worker admission"
+        );
+        let later = external
+            .append("owner", "new task queued after stop", true)
+            .await?;
+        store
+            .append("harness", "all workers drained; work stopped", false)
+            .await?;
+        assert_eq!(
+            store.unfinished_prompt().await?,
+            Some(later.clone()),
+            "old drain cannot discard a newly queued task"
+        );
+        store.finish_round().await?;
+        store
+            .drain_round(
+                "Owner closed session; draining in-flight operations.".into(),
+                |_| {},
+            )
+            .await?;
+        store
+            .append("harness", "all workers drained; session detached", false)
+            .await?;
+        assert_eq!(
+            external.unfinished_prompt().await?,
+            Some(later),
+            "detach preserves unfinished work for explicit resume"
         );
         Ok(())
     }

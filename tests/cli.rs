@@ -127,3 +127,167 @@ fn auth_list_includes_saved_custom_and_configured_providers_without_credentials(
     assert!(!text.contains("private-saved-key"));
     assert!(!text.contains("private-configured-key"));
 }
+
+#[test]
+fn session_history_is_scoped_to_cwd_and_explicit_ids_can_cross_workspaces() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first");
+    let second = directory.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let auth = directory.path().join("auth.json");
+    let isolated = || {
+        let mut cmd = command();
+        cmd.env("OPENRAID_AUTH_FILE", &auth)
+            .env("XDG_CONFIG_HOME", directory.path());
+        cmd
+    };
+    for (workspace, objective) in [
+        (&first, "first project task"),
+        (&second, "second project task"),
+    ] {
+        successful_json(
+            isolated()
+                .args([
+                    "demo",
+                    objective,
+                    "--agents",
+                    "2",
+                    "--no-tui",
+                    "--grace-secs",
+                    "0",
+                ])
+                .current_dir(workspace)
+                .output()
+                .unwrap(),
+        );
+    }
+    let local = successful_json(
+        isolated()
+            .args(["sessions", "--json"])
+            .current_dir(&first)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(local.as_array().unwrap().len(), 1);
+    assert_eq!(local[0]["title"], "first project task");
+    let id = local[0]["id"].as_str().unwrap();
+    let database = std::path::PathBuf::from(local[0]["database"].as_str().unwrap());
+    let all = successful_json(
+        isolated()
+            .args(["sessions", "--all", "--json"])
+            .current_dir(&second)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(all.as_array().unwrap().len(), 2);
+    // An explicit ID selects the original workspace even when invoked elsewhere.
+    successful_json(
+        isolated()
+            .args([
+                "demo",
+                "explicit reopen",
+                "--session",
+                id,
+                "--no-tui",
+                "--grace-secs",
+                "0",
+            ])
+            .current_dir(&second)
+            .output()
+            .unwrap(),
+    );
+    let board = successful_json(
+        isolated()
+            .arg("board")
+            .arg("--database")
+            .arg(&database)
+            .output()
+            .unwrap(),
+    );
+    assert!(board.as_array().unwrap().iter().any(|entry| entry["body"]
+        .as_str()
+        .is_some_and(|body| body.contains("explicit reopen"))));
+    successful_json(
+        isolated()
+            .args([
+                "demo",
+                "separate task",
+                "--new",
+                "--agents",
+                "1",
+                "--no-tui",
+                "--grace-secs",
+                "0",
+            ])
+            .current_dir(&first)
+            .output()
+            .unwrap(),
+    );
+    let local = successful_json(
+        isolated()
+            .args(["sessions", "--json"])
+            .current_dir(&first)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(local.as_array().unwrap().len(), 2);
+    let mismatch = isolated()
+        .args(["demo", "--session", id, "--workspace"])
+        .arg(&second)
+        .args(["--no-tui"])
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("belongs to"));
+    let durable_state = || {
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT revision, next_id,
+                (SELECT group_concat(agent_id || ':' || active, '|') FROM members),
+                (SELECT draining FROM membership_phase),
+                (SELECT COUNT(*) FROM votes), (SELECT COUNT(*) FROM board)
+             FROM membership_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let before = durable_state();
+    let wrong_database = isolated()
+        .args([
+            "demo",
+            "must not mutate another project",
+            "--agents",
+            "3",
+            "--database",
+        ])
+        .arg(&database)
+        .args(["--no-tui", "--grace-secs", "0"])
+        .current_dir(&second)
+        .output()
+        .unwrap();
+    assert!(!wrong_database.status.success());
+    assert!(String::from_utf8_lossy(&wrong_database.stderr).contains("belongs to"));
+    assert_eq!(
+        durable_state(),
+        before,
+        "rejected open must not mutate durable session state"
+    );
+    let missing = isolated()
+        .args(["demo", "--session", "does-not-exist", "--no-tui"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown session"));
+}

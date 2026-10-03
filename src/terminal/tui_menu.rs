@@ -9,6 +9,7 @@ use ratatui::{
 
 #[derive(Clone)]
 pub enum Kind {
+    Sessions,
     Mcp,
     Members,
     RemoveAgents,
@@ -26,6 +27,13 @@ pub enum Kind {
 }
 #[derive(Clone)]
 pub enum Action {
+    Sessions,
+    NewSession,
+    OpenSession(String),
+    Start,
+    Pause,
+    Resume,
+    Stop,
     ChooseProvider(String),
     Mcp,
     Members,
@@ -71,6 +79,24 @@ pub enum Outcome {
 pub fn command(text: &str) -> Option<Action> {
     let mut words = text.split_whitespace();
     match words.next()? {
+        "/sessions" | "/session" => Some(
+            words
+                .next()
+                .map(|id| Action::OpenSession(id.into()))
+                .unwrap_or(Action::Sessions),
+        ),
+        "/new" => Some(Action::NewSession),
+        "/start" => {
+            let prompt = text.trim().strip_prefix("/start").unwrap_or("").trim();
+            Some(if prompt.is_empty() {
+                Action::Start
+            } else {
+                Action::Submit(prompt.into())
+            })
+        }
+        "/pause" => Some(Action::Pause),
+        "/resume" => Some(Action::Resume),
+        "/stop" => Some(Action::Stop),
         "/models" | "/model" => Some(
             words
                 .next()
@@ -134,6 +160,36 @@ impl Menu {
             Kind::Commands,
             [
                 (
+                    "/sessions",
+                    "Browse workspace sessions",
+                    "Ctrl+X S · switch to a saved session when idle",
+                ),
+                (
+                    "/new",
+                    "Create a new session",
+                    "Ctrl+X N · fresh board and history in this workspace",
+                ),
+                (
+                    "/start",
+                    "Start work",
+                    "Focus the prompt editor, or /start your objective",
+                ),
+                (
+                    "/pause",
+                    "Pause work",
+                    "Ctrl+X P · current operations finish; no new work starts",
+                ),
+                (
+                    "/resume",
+                    "Resume work",
+                    "Ctrl+X R · continue the paused objective",
+                ),
+                (
+                    "/stop",
+                    "Stop current work",
+                    "Ctrl+X X · drain current operations and return idle",
+                ),
+                (
                     "/members",
                     "Manage parallel agents",
                     "Inspect the current roster; add or gracefully remove workers",
@@ -186,7 +242,7 @@ impl Menu {
                 (
                     "/quit",
                     "Close or detach",
-                    "Active work continues to native consensus",
+                    "Close interactive sessions gracefully; unfinished work remains resumable",
                 ),
             ]
             .into_iter()
@@ -287,6 +343,7 @@ impl Menu {
                 };
                 return match self.kind {
                     Kind::Commands => Outcome::Action(command(&entry.id).unwrap()),
+                    Kind::Sessions => Outcome::Action(Action::OpenSession(entry.id.clone())),
                     Kind::Connect => Outcome::Provider(entry.id.clone()),
                     Kind::Models => Outcome::Action(Action::SelectModel(entry.id.clone())),
                     Kind::Mcp => Outcome::Action(Action::ToggleMcp(entry.id.clone())),
@@ -319,6 +376,7 @@ impl Menu {
             height,
         );
         let (title, help) = match &self.kind {
+            Kind::Sessions => (" /sessions · this workspace ", "Enter opens the selected session when idle · /new creates fresh history"),
             Kind::Members => (
                 " /members · parallel agents ",
                 "Enter adds a worker or removes the selected agent after its current operations drain",

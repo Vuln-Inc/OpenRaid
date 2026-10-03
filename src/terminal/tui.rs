@@ -52,18 +52,14 @@ pub struct SessionInfo {
     pub objective: String,
 }
 
-const COMMANDS: [(&str, &str, KeyCode); 15] = [
+const COMMANDS: [(&str, &str, KeyCode); 21] = [
     ("Send an owner instruction", "o", KeyCode::Char('o')),
     ("Toggle live following", "f", KeyCode::Char('f')),
     ("Focus the shared board", "1", KeyCode::Char('1')),
     ("Focus the agent roster", "2", KeyCode::Char('2')),
     ("Focus the selected agent stream", "3", KeyCode::Char('3')),
     ("Show all keyboard controls", "?", KeyCode::Char('h')),
-    (
-        "Detach console; keep agents running",
-        "q",
-        KeyCode::Char('q'),
-    ),
+    ("Close / detach the console", "q", KeyCode::Char('q')),
     (
         "Switch provider / model",
         "Ctrl+X M · /models",
@@ -88,6 +84,24 @@ const COMMANDS: [(&str, &str, KeyCode); 15] = [
         "Ctrl+X - · /remove [IDs]",
         KeyCode::F(9),
     ),
+    (
+        "Browse workspace sessions",
+        "Ctrl+X S · /sessions",
+        KeyCode::F(10),
+    ),
+    ("Create a new session", "Ctrl+X N · /new", KeyCode::F(11)),
+    ("Start work / edit prompt", "/start", KeyCode::Char('o')),
+    (
+        "Pause current work",
+        "Ctrl+X P · /pause",
+        KeyCode::Char('p'),
+    ),
+    (
+        "Resume paused work",
+        "Ctrl+X R · /resume",
+        KeyCode::Char('r'),
+    ),
+    ("Stop current work", "Ctrl+X X · /stop", KeyCode::F(12)),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,6 +150,12 @@ struct UiState {
     member_count: Option<usize>,
     draining_count: usize,
     current_votes: Option<usize>,
+    paused: bool,
+    stopping: bool,
+    session_id: String,
+    workspace: String,
+    database: String,
+    control_hits: Vec<(Rect, Action)>,
 }
 
 impl Default for UiState {
@@ -179,6 +199,12 @@ impl Default for UiState {
             member_count: None,
             draining_count: 0,
             current_votes: None,
+            paused: false,
+            stopping: false,
+            session_id: String::new(),
+            workspace: String::new(),
+            database: String::new(),
+            control_hits: Vec::new(),
         }
     }
 }
@@ -232,6 +258,11 @@ impl UiState {
                 KeyCode::Char('t') => self.actions.push_back(Action::Variants),
                 KeyCode::Char('j') => self.actions.push_back(Action::JumpList),
                 KeyCode::Char('a') => self.actions.push_back(Action::Grid),
+                KeyCode::Char('s') => self.actions.push_back(Action::Sessions),
+                KeyCode::Char('n') => self.actions.push_back(Action::NewSession),
+                KeyCode::Char('p') => self.actions.push_back(Action::Pause),
+                KeyCode::Char('r') => self.actions.push_back(Action::Resume),
+                KeyCode::Char('x') => self.actions.push_back(Action::Stop),
                 KeyCode::Char('+') | KeyCode::Char('=') => {
                     self.actions.push_back(Action::AddAgents(1))
                 }
@@ -256,7 +287,7 @@ impl UiState {
                 self.menu_epoch += 1;
                 self.leader = true;
                 self.notice =
-                    "Ctrl+X: M models · C connect · T variants · J jump · A grid · + add · - remove".into();
+                    "Ctrl+X: S sessions · N new · P pause · R resume · X stop · M models · +/- agents".into();
                 return Ok(false);
             }
             if key.code == KeyCode::Char('t') {
@@ -399,10 +430,14 @@ impl UiState {
             KeyCode::F(7) => self.actions.push_back(Action::Members),
             KeyCode::F(8) => self.actions.push_back(Action::AddAgents(1)),
             KeyCode::F(9) => self.actions.push_back(Action::RemoveList),
+            KeyCode::F(10) => self.actions.push_back(Action::Sessions),
+            KeyCode::F(11) => self.actions.push_back(Action::NewSession),
+            KeyCode::F(12) => self.actions.push_back(Action::Stop),
+            KeyCode::Char('p') => self.actions.push_back(Action::Pause),
+            KeyCode::Char('r') => self.actions.push_back(Action::Resume),
             KeyCode::Char('/') => self.menu = Some(Menu::commands()),
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('h') | KeyCode::Char('?') | KeyCode::F(1) => self.help = true,
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => self.palette = true,
             KeyCode::Char(':') => self.palette = true,
             KeyCode::Char('1') => self.focus = Focus::Board,
             KeyCode::Char('2') => self.focus = Focus::Agents,
@@ -576,6 +611,8 @@ enum JobResult {
     Restored(String, bool),
     Jumped(u64),
     MembershipChanged(String),
+    LifecycleChanged(String),
+    Navigate,
 }
 
 type ConsoleJob = (u64, bool, bool, tokio::task::JoinHandle<Result<JobResult>>);
@@ -680,6 +717,70 @@ fn refresh_mcp_menu(app: &mut UiState, hub: &crate::mcp::Hub) {
 
 async fn perform(action: Action, manager: ProviderManager, store: Store) -> Result<JobResult> {
     match action {
+        Action::Sessions => {
+            let current = manager.control.current();
+            let database = std::fs::canonicalize(&current.config.database)
+                .unwrap_or_else(|_| current.config.database.clone());
+            let sessions = crate::session_catalog::list(Some(&current.config.workspace))?;
+            Ok(JobResult::Open(
+                Kind::Sessions,
+                sessions
+                    .into_iter()
+                    .map(|session| Entry {
+                        label: if session.database == database {
+                            format!("{} · current · {}", session.id, session.title)
+                        } else {
+                            format!("{} · {}", session.id, session.title)
+                        },
+                        detail: format!(
+                            "{} · {}",
+                            session.workspace.display(),
+                            session.database.display()
+                        ),
+                        id: session.id,
+                    })
+                    .collect(),
+            ))
+        }
+        Action::NewSession => {
+            manager
+                .control
+                .request_navigation(crate::session::SessionNavigation::New)
+                .await?;
+            Ok(JobResult::Navigate)
+        }
+        Action::OpenSession(id) => {
+            let session = crate::session_catalog::find(&id)?;
+            let current = manager.control.current();
+            let database = std::fs::canonicalize(&current.config.database)
+                .unwrap_or_else(|_| current.config.database.clone());
+            if session.database == database {
+                return Ok(JobResult::LifecycleChanged(
+                    "This session is already open.".into(),
+                ));
+            }
+            manager
+                .control
+                .request_navigation(crate::session::SessionNavigation::Open(id))
+                .await?;
+            Ok(JobResult::Navigate)
+        }
+        Action::Pause => {
+            manager.control.pause().await?;
+            Ok(JobResult::LifecycleChanged(
+                "Paused. Current operations finish; resume to continue.".into(),
+            ))
+        }
+        Action::Resume => {
+            manager.control.resume().await?;
+            Ok(JobResult::LifecycleChanged("Resumed current work.".into()))
+        }
+        Action::Stop => {
+            manager.control.stop_work().await?;
+            Ok(JobResult::LifecycleChanged(
+                "Stopping current work. In-flight operations drain before returning idle.".into(),
+            ))
+        }
         Action::Members | Action::RemoveList => {
             let kind = if matches!(action, Action::Members) {
                 Kind::Members
@@ -801,6 +902,7 @@ async fn dispatch_roster_actions(
     manager: Option<&ProviderManager>,
     store: &Store,
     jobs: &mut tokio::task::JoinSet<Result<JobResult>>,
+    primary_mutation_pending: bool,
 ) -> Result<()> {
     while let Some(index) = app.actions.iter().position(|action| {
         matches!(
@@ -810,9 +912,21 @@ async fn dispatch_roster_actions(
                 | Action::AddAgents(_)
                 | Action::RemoveAgents(_)
                 | Action::InvalidCommand(_)
+                | Action::Pause
+                | Action::Resume
+                | Action::Stop
+                | Action::Sessions
+                | Action::NewSession
+                | Action::OpenSession(_)
+                | Action::Start
         )
     }) {
         let action = app.actions.remove(index).unwrap();
+        if matches!(action, Action::Start) {
+            app.composing = true;
+            app.notice = "Enter an objective, then press Enter to start work.".into();
+            continue;
+        }
         if let Action::InvalidCommand(message) = action {
             app.notice = message;
             continue;
@@ -821,21 +935,32 @@ async fn dispatch_roster_actions(
             app.notice = "Session controls require the managed console".into();
             continue;
         };
-        if matches!(action, Action::Members | Action::RemoveList) {
-            // These menus use only the locally published roster, with no remote
-            // discovery or write. Opening them cannot wait on the main job lane.
-            if let JobResult::Open(kind, entries) =
-                perform(action, manager.clone(), store.clone()).await?
-            {
-                app.menu_epoch += 1;
-                app.menu = Some(Menu::new(kind, entries, None));
-                app.notice.clear();
+        if matches!(action, Action::NewSession | Action::OpenSession(_))
+            && (!jobs.is_empty() || app.pending_submit || primary_mutation_pending)
+        {
+            app.notice = "Wait for pending changes to finish before switching sessions.".into();
+            continue;
+        }
+        if matches!(
+            action,
+            Action::Members | Action::RemoveList | Action::Sessions
+        ) {
+            // Local menus cannot wait on the remote discovery/mutation lane.
+            // A broken metadata file must not take down the live console.
+            match perform(action, manager.clone(), store.clone()).await {
+                Ok(JobResult::Open(kind, entries)) => {
+                    app.menu_epoch += 1;
+                    app.menu = Some(Menu::new(kind, entries, None));
+                    app.notice.clear();
+                }
+                Err(error) => app.notice = format!("session control failed: {error:#}"),
+                _ => {}
             }
         } else {
             let manager = manager.clone();
             let store = store.clone();
             jobs.spawn(async move { perform(action, manager, store).await });
-            app.notice = "Applying roster change… current operations keep running".into();
+            app.notice = "Applying session control…".into();
         }
     }
     Ok(())
@@ -857,6 +982,19 @@ async fn run_console(
             .is_some_and(|manager| manager.control.current().config.interactive_session),
         ..UiState::default()
     };
+    if let Some(manager) = &manager {
+        let active = manager.control.current();
+        let database = std::fs::canonicalize(&active.config.database)
+            .unwrap_or_else(|_| active.config.database.clone());
+        app.session_id = crate::session_catalog::list(Some(&active.config.workspace))
+            .unwrap_or_default()
+            .into_iter()
+            .find(|session| session.database == database)
+            .map(|session| session.id)
+            .unwrap_or_default();
+        app.workspace = active.config.workspace.display().to_string();
+        app.database = active.config.database.display().to_string();
+    }
     app.load(&store).await?;
     let mut board_changes = store.subscribe_board();
     let mut events = EventStream::new();
@@ -879,6 +1017,10 @@ async fn run_console(
                     app.session.model = active.config.model.clone();
                     app.session.variant = active.config.variant.clone().unwrap_or_else(|| "default".into());
                     app.busy = manager.control.is_busy();
+                    app.paused = manager.control.is_paused();
+                    app.stopping = manager.control.is_stopping();
+                    app.workspace = active.config.workspace.display().to_string();
+                    app.database = active.config.database.display().to_string();
                     let members = manager.control.members();
                     refresh_roster_menu(&mut app, &members);
                     refresh_mcp_menu(&mut app, &manager.control.mcp);
@@ -911,8 +1053,12 @@ async fn run_console(
                     Some(Ok(Ok(JobResult::MembershipChanged(message)))) => {
                         app.notice = message; app.follow = true; board_dirty = true;
                     },
-                    Some(Ok(Err(error))) => app.notice = format!("roster change failed: {error:#}"),
-                    Some(Err(error)) => app.notice = format!("roster change failed: {error}"),
+                    Some(Ok(Ok(JobResult::LifecycleChanged(message)))) => {
+                        app.notice = message; board_dirty = true;
+                    },
+                    Some(Ok(Ok(JobResult::Navigate))) => break,
+                    Some(Ok(Err(error))) => app.notice = format!("session control failed: {error:#}"),
+                    Some(Err(error)) => app.notice = format!("session control failed: {error}"),
                     _ => {},
                 }
             },
@@ -945,6 +1091,10 @@ async fn run_console(
                     Ok(Ok(JobResult::MembershipChanged(message))) => {
                         app.notice = message; app.follow = true; board_dirty = true;
                     },
+                    Ok(Ok(JobResult::LifecycleChanged(message))) => {
+                        app.notice = message; board_dirty = true;
+                    },
+                    Ok(Ok(JobResult::Navigate)) => break,
                     Ok(Ok(JobResult::Restored(text,snapshot))) => {
                         app.draft = text; app.composing = true;
                         app.notice = if snapshot {"Prompt restored to editor; workspace reverted to its pre-prompt snapshot"} else {"Prompt restored to editor; no workspace snapshot exists for this prompt"}.into();
@@ -972,6 +1122,10 @@ async fn run_console(
                 },
                 Some(Ok(Event::Mouse(mouse))) if app.menu.is_none() && !app.help && !app.palette => {
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                        if let Some((_,action)) = app.control_hits.iter().find(|(rect,_)| rect.contains((mouse.column,mouse.row).into())) {
+                            app.actions.push_back(action.clone());
+                            continue;
+                        }
                         if let Some((_,seq)) = app.prompt_hits.iter().find(|(rect,_)| rect.contains((mouse.column,mouse.row).into())) {
                             app.menu = Some(Menu::new(Kind::Prompt(*seq), vec![
                                 Entry {id:"copy".into(),label:"Copy prompt".into(),detail:"Copy the complete prompt text to your clipboard".into()},
@@ -1000,7 +1154,8 @@ async fn run_console(
                 None => break,
             }
         }
-        dispatch_roster_actions(&mut app, manager.as_ref(), &store, &mut roster_jobs).await?;
+        let primary_mutation_pending = job.as_ref().is_some_and(|(_, _, read_only, _)| !read_only);
+        dispatch_roster_actions(&mut app, manager.as_ref(), &store, &mut roster_jobs, primary_mutation_pending).await?;
         cancel_stale_menu_job(app.menu_epoch, &mut job);
         if job.is_none() {
             if let Some(action) = app.actions.pop_front() {
@@ -1137,11 +1292,21 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
         area,
     );
     let rows = Layout::vertical([
-        Constraint::Length(if area.height >= 24 { 4 } else { 2 }),
+        Constraint::Length(if area.height >= 24 {
+            if app.managed {
+                6
+            } else {
+                4
+            }
+        } else if app.managed {
+            4
+        } else {
+            2
+        }),
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(if app.managed { 6 } else { 3 }),
-        Constraint::Length(2),
+        Constraint::Length(if app.managed { 3 } else { 2 }),
     ])
     .split(area);
     let uptime = snapshot.elapsed_secs as u64;
@@ -1155,6 +1320,28 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
                 " openraid  "
             },
             Style::default().fg(SEA).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if app.managed {
+                if app.stopping {
+                    "STOPPING  "
+                } else if app.paused {
+                    "PAUSED  "
+                } else if app.busy {
+                    "RUNNING  "
+                } else {
+                    "IDLE  "
+                }
+            } else {
+                ""
+            },
+            Style::default()
+                .fg(if app.paused || app.stopping {
+                    AMBER
+                } else {
+                    SEA
+                })
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("{members} agents  {} draining  ", app.draining_count),
@@ -1190,6 +1377,25 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
             Style::default().fg(COBALT),
         ),
     ];
+    if app.managed {
+        header.push(Line::styled(
+            format!(" cwd: {}", app.workspace),
+            Style::default().fg(ICE),
+        ));
+        header.push(Line::styled(
+            format!(
+                " Session: {}{}{}",
+                app.session_id,
+                if app.session_id.is_empty() {
+                    ""
+                } else {
+                    " · "
+                },
+                app.database
+            ),
+            Style::default().fg(MUTED),
+        ));
+    }
     if area.height >= 24 {
         header.push(Line::styled(
             format!(
@@ -1282,7 +1488,11 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
             Paragraph::new(format!("{text}{}", if app.composing { "▏" } else { "" }))
                 .wrap(Wrap { trim: false })
                 .block(block(
-                    if app.busy {
+                    if app.stopping {
+                        " Prompt · stopping · wait for in-flight operations to drain "
+                    } else if app.paused {
+                        " Prompt · paused · /resume continues · /stop ends work "
+                    } else if app.busy {
                         " Prompt · working · Enter sends a follow-up "
                     } else {
                         " Prompt · ready · Enter starts work "
@@ -1303,15 +1513,24 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
             rows[3],
         );
     }
+    app.control_hits.clear();
+    let footer = if app.managed {
+        let footer_rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(2)]).split(rows[4]);
+        draw_session_controls(frame, footer_rows[0], app);
+        footer_rows[1]
+    } else {
+        rows[4]
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                " / commands  Ctrl+X M/C/T menus · +/- agents  Ctrl+T cycle  Ctrl+P palette  Esc then q detach",
+                " / commands · Ctrl+X S sessions · P pause · R resume · X stop · Esc then q detach",
                 Style::default().fg(SEA),
             ),
             Line::styled(app.notice.clone(), Style::default().fg(AMBER)),
         ]),
-        rows[4],
+        footer,
     );
     if app.composing && !app.managed {
         draw_composer(frame, app);
@@ -1325,6 +1544,43 @@ fn draw(frame: &mut Frame<'_>, app: &mut UiState, snapshot: &MetricsSnapshot, me
     if let Some(menu) = &app.menu {
         menu.draw(frame);
     }
+}
+
+fn draw_session_controls(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
+    let controls = [
+        (" Sessions ", Action::Sessions),
+        (" New ", Action::NewSession),
+        (" Start ", Action::Start),
+        (
+            if app.paused { " Resume " } else { " Pause " },
+            if app.paused {
+                Action::Resume
+            } else {
+                Action::Pause
+            },
+        ),
+        (" Stop ", Action::Stop),
+    ];
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (label, action) in controls {
+        let width = (label.len() as u16).min(area.right().saturating_sub(x));
+        if width == 0 {
+            break;
+        }
+        app.control_hits
+            .push((Rect::new(x, area.y, width, area.height.min(1)), action));
+        spans.push(Span::styled(
+            label,
+            Style::default()
+                .fg(SEA)
+                .bg(Color::Rgb(45, 66, 96))
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        x = x.saturating_add(width + 1);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_grid(
@@ -1588,11 +1844,19 @@ fn draw_composer(frame: &mut Frame<'_>, app: &UiState) {
 }
 
 fn draw_help(frame: &mut Frame<'_>) {
-    let area = popup(frame.area(), 94, 29);
+    let area = popup(frame.area(), 104, 38);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(
-            "/models (/model)   choose from connected providers only\n\
+            "/sessions         browse sessions for this workspace; /session ID opens any session\n\
+         /new              create fresh session history in this workspace (idle only)\n\
+         /start [prompt]   start an objective, or focus the prompt editor\n\
+         /pause            pause at safe operation boundaries; current operations finish\n\
+         /resume           continue paused work with the same context\n\
+         /stop             drain current work and return idle; no completion vote required\n\
+         Ctrl+X S/N        workspace sessions / new session\n\
+         Ctrl+X P/R/X      pause / resume / stop, even while editing a prompt\n\
+         /models (/model)   choose from connected providers only\n\
          /connect          add or replace a provider key\n\
          /variant          thinking menu; Ctrl+T cycles variants\n\
          /jump             search every sent prompt\n\
@@ -1611,8 +1875,8 @@ fn draw_help(frame: &mut Frame<'_>) {
          Home/End, F       first/latest and follow\n\
          O                 focus prompt editor; Enter submits\n\
          ? / H / F1        help\n\
-         Esc then Q        detach active work, or close an idle home\n\
-         /quit             same close/detach action\n\n\
+         Esc then Q        close interactive sessions gracefully; preserve unfinished work\n\
+         /quit             same action; noninteractive runs continue headless\n\n\
          The board stays global, durable, and unfiltered.\n\
          Restore uses pre-prompt Git snapshots when available and runs only idle.",
         )
@@ -1650,6 +1914,108 @@ fn draw_palette(frame: &mut Frame<'_>, app: &UiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn lifecycle_shortcuts_work_inside_composer_and_do_not_post_commands() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let store = Store::open(directory.path().join("lifecycle-ui.sqlite")).await?;
+        let mut app = UiState {
+            managed: true,
+            composing: true,
+            draft: "draft objective stays intact".into(),
+            ..UiState::default()
+        };
+        for (key, matches_action) in [('p', 0), ('r', 1), ('x', 2), ('s', 3), ('n', 4)] {
+            app.key(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &store,
+                1,
+            )
+            .await?;
+            app.key(
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE),
+                &store,
+                1,
+            )
+            .await?;
+            let action = app
+                .actions
+                .pop_front()
+                .context("shortcut did not queue action")?;
+            assert!(match matches_action {
+                0 => matches!(action, Action::Pause),
+                1 => matches!(action, Action::Resume),
+                2 => matches!(action, Action::Stop),
+                3 => matches!(action, Action::Sessions),
+                _ => matches!(action, Action::NewSession),
+            });
+            assert_eq!(app.draft, "draft objective stays intact");
+        }
+        for command in ["/pause", "/resume", "/stop", "/sessions", "/new"] {
+            app.draft = command.into();
+            app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &store, 1)
+                .await?;
+            assert!(app.draft.is_empty());
+            assert!(!app.actions.is_empty());
+            app.actions.clear();
+        }
+        assert!(store.read_board(0, 100).await?.is_empty());
+        assert!(
+            matches!(crate::tui_menu::command("/start fix session controls"), Some(Action::Submit(text)) if text == "fix session controls")
+        );
+        assert!(
+            matches!(crate::tui_menu::command("/session external-id"), Some(Action::OpenSession(id)) if id == "external-id")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_console_shows_workspace_state_and_clickable_controls_at_compact_sizes() {
+        let metrics = Metrics::new(1);
+        for (width, height) in [(60, 18), (80, 24), (150, 44)] {
+            let mut app = UiState {
+                managed: true,
+                busy: true,
+                paused: true,
+                workspace: "workspace-alpha".into(),
+                database: "session-alpha.sqlite3".into(),
+                ..UiState::default()
+            };
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw(frame, &mut app, &metrics.snapshot(), &metrics))
+                .unwrap();
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            for text in [
+                "PAUSED",
+                "cwd: workspace-alpha",
+                "Session: session-alpha.sqlite3",
+                "Sessions",
+                "New",
+                "Start",
+                "Resume",
+                "Stop",
+            ] {
+                assert!(
+                    rendered.contains(text),
+                    "missing {text} at {width}x{height}"
+                );
+            }
+            assert_eq!(app.control_hits.len(), 5);
+            assert!(app.control_hits.iter().all(|(rect, _)| rect.width > 0
+                && rect.height == 1
+                && rect.right() <= width
+                && rect.bottom() <= height));
+            assert!(matches!(app.control_hits[3].1, Action::Resume));
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires Node.js for a real MCP status-transition fixture"]
@@ -1795,7 +2161,14 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
         app.actions
             .extend([Action::Models, Action::AddAgents(2), Action::Members]);
         let mut roster_jobs = tokio::task::JoinSet::new();
-        dispatch_roster_actions(&mut app, Some(&manager), &harness.store, &mut roster_jobs).await?;
+        dispatch_roster_actions(
+            &mut app,
+            Some(&manager),
+            &harness.store,
+            &mut roster_jobs,
+            true,
+        )
+        .await?;
         cancel_stale_menu_job(app.menu_epoch, &mut main_job);
         assert!(
             main_job.as_ref().is_some_and(|job| !job.3.is_finished()),
@@ -1847,7 +2220,14 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
         let removed = manager.control.members().last().unwrap().clone();
         app.actions
             .extend([Action::RemoveAgents(vec![removed]), Action::RemoveList]);
-        dispatch_roster_actions(&mut app, Some(&manager), &harness.store, &mut roster_jobs).await?;
+        dispatch_roster_actions(
+            &mut app,
+            Some(&manager),
+            &harness.store,
+            &mut roster_jobs,
+            true,
+        )
+        .await?;
         assert!(matches!(
             roster_jobs.join_next().await.unwrap()??,
             JobResult::MembershipChanged(_)
@@ -1860,6 +2240,50 @@ require('node:readline').createInterface({input:process.stdin}).on('line', messa
             "an open removal selector catches up after parallel mutations"
         );
         assert!(harness.store.prompts().await?.is_empty());
+        for (action, paused) in [
+            (Action::Pause, true),
+            (Action::Resume, false),
+            (Action::Stop, false),
+        ] {
+            app.actions.push_back(action);
+            dispatch_roster_actions(
+                &mut app,
+                Some(&manager),
+                &harness.store,
+                &mut roster_jobs,
+                true,
+            )
+            .await?;
+            let result = tokio::time::timeout(Duration::from_secs(2), roster_jobs.join_next())
+                .await?
+                .context("missing lifecycle job")???;
+            assert!(matches!(result, JobResult::LifecycleChanged(_)));
+            assert_eq!(manager.control.is_paused(), paused);
+            assert!(
+                main_job.as_ref().is_some_and(|job| !job.3.is_finished()),
+                "lifecycle controls cannot wait on a remote action"
+            );
+        }
+        assert!(harness.store.prompts().await?.is_empty());
+        app.actions.extend([
+            Action::NewSession,
+            Action::OpenSession("held-session".into()),
+        ]);
+        dispatch_roster_actions(
+            &mut app,
+            Some(&manager),
+            &harness.store,
+            &mut roster_jobs,
+            true,
+        )
+        .await?;
+        assert!(app.notice.contains("Wait for pending changes"));
+        assert!(
+            roster_jobs.is_empty(),
+            "navigation must not detach while a remote mutation is pending"
+        );
+        assert!(!manager.control.is_closing());
+        assert!(manager.control.take_navigation().is_none());
         release.send(()).unwrap();
         let (epoch, _, _, job) = main_job.take().unwrap();
         if let JobResult::Connected(provider) = job.await?? {

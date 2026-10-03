@@ -176,6 +176,21 @@ impl Harness {
             elapsed_ms: 0,
         };
         loop {
+            // A prompt can be posted and stopped before the runtime future is
+            // first polled. Preserve that acknowledged stop instead of clearing
+            // its signal while starting the now-abandoned queued task.
+            if *self.shutdown.borrow() && self.control.work_was_stopped() {
+                cursor = cursor.max(self.control.drain_cursor());
+                if pending.as_ref().is_some_and(|(_, seq, _)| *seq <= cursor) {
+                    pending = None;
+                }
+                self.store
+                    .append("harness", "all workers drained; work stopped", false)
+                    .await?;
+                self.store.finish_round().await?;
+                self.shutdown.send_replace(false);
+                self.control.set_busy(false);
+            }
             self.control
                 .publish_membership(self.store.membership().await?);
             for id in self.control.members() {
@@ -202,22 +217,30 @@ impl Harness {
                     }
                 }
             }
-            if *stop.borrow() && pending.is_none() {
+            if *stop.borrow() {
                 break;
             }
             if let Some((objective, seq, post)) = pending.take() {
+                if !self.control.try_begin_work().await {
+                    pending = Some((objective, seq, post));
+                    continue;
+                }
                 let mut config = (*self.control.current().config).clone();
                 config.objective = objective;
                 config.resume = rounds == 0 && self.config.resume;
-                self.control.begin_work().await;
-                self.shutdown.send_replace(false);
                 let result = self.run_round(Arc::new(config), post, seq).await;
-                self.control.set_busy(false);
                 self.shutdown.send_replace(false);
+                self.control.set_busy(false);
                 for id in self.control.members() {
                     self.metrics.set_status(&id, AgentStatus::Waiting);
-                    self.metrics
-                        .set_detail(&id, "idle · previous work completed");
+                    self.metrics.set_detail(
+                        &id,
+                        if self.control.work_was_stopped() {
+                            "idle · previous work stopped"
+                        } else {
+                            "idle · previous work completed"
+                        },
+                    );
                 }
                 match result {
                     Ok((summary, consumed)) => {
@@ -284,15 +307,27 @@ impl Harness {
             } else {
                 None
             };
-            let seq = self
+            match self
                 .store
-                .append("owner", &config.objective, true)
-                .await?
-                .seq;
-            if let Some(tree) = snapshot {
-                self.store.save_snapshot(seq, tree).await?;
+                .owner_action(
+                    "owner",
+                    config.objective.clone(),
+                    self.shutdown.subscribe(),
+                    || {},
+                )
+                .await
+            {
+                Ok(message) => {
+                    if let Some(tree) = snapshot {
+                        self.store.save_snapshot(message.seq, tree).await?;
+                    }
+                    message.seq
+                }
+                // Operator stop won the actor transaction before the initial
+                // objective was admitted. There is no new task to dispatch.
+                Err(_) if *self.shutdown.borrow() => self.control.drain_cursor(),
+                Err(error) => return Err(error),
             }
-            seq
         } else {
             prompt_seq
         };
@@ -332,10 +367,24 @@ impl Harness {
         let mut supervisor_cursor = 0;
         let mut finished = 0;
         let final_votes;
+        let completed;
+        let mut closing = self.control.stop_receiver();
+        let mut round_stop = self.shutdown.subscribe();
         loop {
+            if self.control.is_closing() && !*self.shutdown.borrow() {
+                self.control.drain_work(false).await?;
+            }
+            if *self.shutdown.borrow() {
+                final_votes = 0;
+                completed = false;
+                owner_revision = self.control.drain_cursor();
+                break;
+            }
             tokio::select! {
                 _ = tick.tick() => {},
                 _ = membership.changed() => {},
+                _ = closing.changed() => { continue; },
+                _ = round_stop.changed() => { continue; },
                 exit = workers.join_next_with_id() => {
                     if let Some(exit) = exit {
                         let (task_id, detail) = match exit {
@@ -396,6 +445,10 @@ impl Harness {
                 .iter()
                 .filter(|v| v.done && v.board_seq == global_seq && ids.contains(&v.agent_id))
                 .count();
+            if self.control.is_paused() {
+                consensus.update(0, global_seq, Instant::now());
+                continue;
+            }
             if consensus.update(done, global_seq, Instant::now()) {
                 let Some(confirmed_done) = self
                     .store
@@ -411,6 +464,7 @@ impl Harness {
                     continue;
                 };
                 final_votes = confirmed_done;
+                completed = true;
                 self.shutdown.send_replace(true);
                 break;
             }
@@ -443,7 +497,17 @@ impl Harness {
             finished += 1;
         }
         self.store
-            .append("harness", "all workers drained; swarm complete", false)
+            .append(
+                "harness",
+                if completed {
+                    "all workers drained; swarm complete"
+                } else if self.control.work_was_stopped() {
+                    "all workers drained; work stopped"
+                } else {
+                    "all workers drained; session detached"
+                },
+                false,
+            )
             .await?;
         if self.config.interactive_session && !*self.control.stop_receiver().borrow() {
             self.store.finish_round().await?;
@@ -576,6 +640,10 @@ async fn agent_worker(
             &id,
             if *shutdown.removed.borrow() {
                 "removed worker drained all in-flight operations; quitting gracefully"
+            } else if shared.control.work_was_stopped() {
+                "worker drained all in-flight operations after owner stopped work"
+            } else if shared.control.is_closing() {
+                "worker drained all in-flight operations before session detach"
             } else {
                 "quitting after harness completion consensus"
             },
@@ -589,6 +657,9 @@ async fn mock_worker(id: &str, shared: &WorkerShared, shutdown: &mut WorkerStop)
     let mut cursor = 0;
     let mut seen = HashSet::new();
     let mut board_revision = shared.store.subscribe_board();
+    if !wait_while_paused(id, shared, shutdown).await? {
+        return Ok(());
+    }
     // Native board tools enforce the same cursor freshness used by real workers.
     read_mock_board(id, shared, &mut cursor, &mut seen).await?;
     if !seen.contains(id) {
@@ -605,6 +676,9 @@ async fn mock_worker(id: &str, shared: &WorkerShared, shutdown: &mut WorkerStop)
     // Every arrival/withdrawal notice wakes this loop. Fixed initial-count
     // barriers cannot represent late joins or gracefully retiring workers.
     while !shutdown.requested() {
+        if !wait_while_paused(id, shared, shutdown).await? {
+            break;
+        }
         read_mock_board(id, shared, &mut cursor, &mut seen).await?;
         if shutdown.requested() {
             break;
@@ -640,6 +714,7 @@ async fn mock_worker(id: &str, shared: &WorkerShared, shutdown: &mut WorkerStop)
         }
         tokio::select! {
             changed = shutdown.changed() => { changed?; },
+            _ = wait_for_pause(&shared.control) => {},
             changed = board_revision.changed() => {
                 changed.context("board notifier disconnected")?;
             }
@@ -717,6 +792,9 @@ async fn live_worker(
     let mut failures: u32 = 0;
     let mut force_compaction = false;
     while !shutdown.requested() {
+        if !wait_while_paused(id, shared, shutdown).await? {
+            break;
+        }
         let active = shared.control.current();
         context.select_model(active.revision, context_config(&active.config));
         if shutdown.requested() {
@@ -782,6 +860,13 @@ async fn live_worker(
         // compaction is awaited. In particular, clearing votes must not turn a
         // parked voter into a request dispatched without the new join notice.
         // Catch up again before admitting that next provider operation.
+        if shared.store.latest_seq().await? > cursor {
+            continue;
+        }
+        if !wait_while_paused(id, shared, shutdown).await? {
+            break;
+        }
+        // Resume can append a control notice while this worker is parked.
         if shared.store.latest_seq().await? > cursor {
             continue;
         }
@@ -851,6 +936,8 @@ async fn live_worker(
             let args = serde_json::from_str::<Value>(&call.arguments);
             let output = if *shutdown.removed.borrow() {
                 json!({"skipped":true,"reason":"worker removed; this tool had not started before retirement. In-flight operations were drained; inspect shared history before resuming elsewhere."})
+            } else if shared.control.work_was_stopped() || shared.control.is_closing() {
+                json!({"skipped":true,"reason":"owner stopped or closed the session before this tool started; admitted operations were drained and this unstarted operation was not executed."})
             } else {
                 match args {
                     Ok(args) => match shared.tools.execute(id, &call.name, &args).await {
@@ -867,6 +954,32 @@ async fn live_worker(
         save_context(id, shared, &context, cursor).await?;
     }
     Ok(())
+}
+
+async fn wait_for_pause(control: &SessionControl) {
+    let mut paused = control.pause_receiver();
+    if !*paused.borrow() {
+        let _ = paused.changed().await;
+    }
+}
+
+/// Pauses never cancel a provider request or split a protocol tool group.
+/// Workers park at dispatch boundaries with all durable history intact.
+async fn wait_while_paused(
+    id: &str,
+    shared: &WorkerShared,
+    shutdown: &mut WorkerStop,
+) -> Result<bool> {
+    let mut paused = shared.control.pause_receiver();
+    while *paused.borrow() && !shutdown.requested() {
+        shared.metrics.set_status(id, AgentStatus::Waiting);
+        shared.metrics.set_detail(id, "paused · resume to continue");
+        tokio::select! {
+            changed = paused.changed() => { changed.context("pause control disconnected")?; },
+            changed = shutdown.changed() => { changed?; },
+        }
+    }
+    Ok(!shutdown.requested())
 }
 
 async fn drain_board(
@@ -906,6 +1019,10 @@ async fn compact_context(
 ) -> Result<bool> {
     let mut failures = 0u32;
     loop {
+        let mut shutdown = WorkerStop::new(shared.shutdown.clone(), shared.control.worker_stop(id));
+        if !wait_while_paused(id, shared, &mut shutdown).await? {
+            return Ok(true);
+        }
         shared
             .control
             .publish_membership(shared.store.membership().await?);
@@ -1337,10 +1454,14 @@ mod tests {
         })
         .await?;
         let store = harness.store.clone();
-        let run = tokio::spawn(harness.run());
+        // Establish the fixture's held operation before launching the very
+        // short mock round. Under parallel load, consensus can otherwise win
+        // before the preparation task ever dispatches its initialize request.
+        harness.control.mcp.prepare_enabled().await;
         tokio::time::timeout(Duration::from_secs(2), started_rx)
             .await
             .context("MCP initialize not started")??;
+        let run = tokio::spawn(harness.run());
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let board = store.read_board(0, 100).await?;

@@ -323,3 +323,293 @@ async fn prompt_posted_before_run_starts_is_processed_without_replaying_history(
     );
     Ok(())
 }
+
+async fn wait_for_board(store: &openraid::storage::Store, expected: &str) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .read_board(0, 100)
+                .await?
+                .iter()
+                .any(|entry| entry.body == expected)
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_drains_inflight_protocol_group_and_resume_uses_preserved_history() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let config = Config {
+        agents: 1,
+        workspace: directory.path().to_owned(),
+        database: directory.path().join("pause.sqlite3"),
+        objective: "verify pause at a safe boundary".into(),
+        base_url: format!("http://{}/v1", listener.local_addr()?),
+        grace_period: Duration::ZERO,
+        ..Config::default()
+    };
+    let harness = Harness::new(config).await?;
+    let control = harness.control.clone();
+    let store = harness.store.clone();
+    let run = tokio::spawn(harness.run());
+    let (mut first, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    request(&mut first).await?;
+    control.pause().await?;
+    assert!(control.is_paused());
+    response(
+        &mut first,
+        "board_post",
+        json!({"body":"in-flight group completed while paused"}),
+    )
+    .await?;
+    // A pause notice makes the pending mutating tool stale. Either a durable
+    // result or rejection is preserved; the worker must not issue another turn.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if store
+                .load_checkpoint("agent-001")
+                .await?
+                .is_some_and(|checkpoint| {
+                    checkpoint["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message["role"] == "tool")
+                })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "paused workers cannot dispatch another request"
+    );
+    control.resume().await?;
+    let (mut second, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    let body = request(&mut second).await?;
+    assert!(body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool" && message["tool_call_id"] == "call-board_post"));
+    response(&mut second, "vote_done", json!({"done":true,"evidence":"verified paused request drained and resume preserved tool history"})).await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await???
+            .finished_agents,
+        1
+    );
+    assert_eq!(
+        store.prompts().await?.len(),
+        1,
+        "lifecycle actions are not task prompts"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_drains_request_skips_unstarted_tools_and_leaves_console_reusable() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let config = Config {
+        agents: 1,
+        workspace: directory.path().to_owned(),
+        database: directory.path().join("stop.sqlite3"),
+        objective: "verify owner stop".into(),
+        base_url: format!("http://{}/v1", listener.local_addr()?),
+        interactive_session: true,
+        grace_period: Duration::ZERO,
+        ..Config::default()
+    };
+    let harness = Harness::new(config).await?;
+    let control = harness.control.clone();
+    let store = harness.store.clone();
+    let run = tokio::spawn(harness.run());
+    let (mut first, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    request(&mut first).await?;
+    control.stop_work().await?;
+    assert!(control.is_stopping());
+    assert!(
+        !run.is_finished(),
+        "stop must drain the admitted HTTP request"
+    );
+    response(
+        &mut first,
+        "write_file",
+        json!({"path":"must-not-exist.txt","content":"unstarted side effect"}),
+    )
+    .await?;
+    wait_for_board(&store, "all workers drained; work stopped").await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while control.is_busy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(!directory.path().join("must-not-exist.txt").exists());
+    assert!(!run.is_finished());
+    assert!(
+        store.unfinished_prompt().await?.is_none(),
+        "explicitly stopped tasks must not silently resume on reopen"
+    );
+    assert!(
+        !store
+            .read_board(0, 100)
+            .await?
+            .iter()
+            .any(|entry| entry.body.contains("completion consensus reached")),
+        "stop cannot claim successful consensus"
+    );
+    let checkpoint = store.load_checkpoint("agent-001").await?.unwrap();
+    assert!(checkpoint["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool"
+            && message["content"].as_str().unwrap().contains("skipped")));
+    control.post_prompt("new task after stop".into()).await?;
+    let (mut second, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    request(&mut second).await?;
+    response(
+        &mut second,
+        "vote_done",
+        json!({"done":true,"evidence":"verified stopped session accepts new task"}),
+    )
+    .await?;
+    wait_for_board(&store, "all workers drained; swarm complete").await?;
+    control.detach();
+    tokio::time::timeout(Duration::from_secs(5), run).await???;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detach_drains_active_request_and_preserves_unfinished_task_for_resume() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let harness = Harness::new(Config {
+        agents: 1,
+        workspace: directory.path().to_owned(),
+        database: directory.path().join("detach.sqlite3"),
+        objective: "unfinished task survives explicit close".into(),
+        base_url: format!("http://{}/v1", listener.local_addr()?),
+        interactive_session: true,
+        ..Config::default()
+    })
+    .await?;
+    let control = harness.control.clone();
+    let store = harness.store.clone();
+    let run = tokio::spawn(harness.run());
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+    request(&mut socket).await?;
+    control.detach();
+    response(&mut socket, "board_post", json!({"body":"unstarted post"})).await?;
+    let summary = tokio::time::timeout(Duration::from_secs(5), run).await???;
+    assert_eq!(summary.votes, 0);
+    assert_eq!(summary.finished_agents, 1);
+    assert_eq!(
+        store.unfinished_prompt().await?.unwrap().body,
+        "unfinished task survives explicit close"
+    );
+    wait_for_board(&store, "all workers drained; session detached").await?;
+    assert!(control
+        .post_prompt("cannot post after close".into())
+        .await
+        .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn navigation_requires_idle_and_is_consumed_once() -> Result<()> {
+    use openraid::session::SessionNavigation;
+    let directory = tempfile::tempdir()?;
+    let harness = Harness::new(Config {
+        agents: 1,
+        workspace: directory.path().to_owned(),
+        database: directory.path().join("navigation.sqlite3"),
+        mock: true,
+        interactive_session: true,
+        ..Config::default()
+    })
+    .await?;
+    harness.control.begin_work().await;
+    assert!(harness
+        .control
+        .request_navigation(SessionNavigation::New)
+        .await
+        .is_err());
+    assert!(!harness.control.is_closing());
+    harness.control.set_busy(false);
+    harness
+        .control
+        .request_navigation(SessionNavigation::Open("session-previous".into()))
+        .await?;
+    assert!(harness.control.is_closing());
+    assert_eq!(
+        harness.control.take_navigation(),
+        Some(SessionNavigation::Open("session-previous".into()))
+    );
+    assert_eq!(harness.control.take_navigation(), None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_prompt_can_be_stopped_before_runtime_start_without_abandoning_navigation_guard(
+) -> Result<()> {
+    use openraid::session::SessionNavigation;
+    let directory = tempfile::tempdir()?;
+    let harness = Harness::new(Config {
+        agents: 1,
+        workspace: directory.path().to_owned(),
+        database: directory.path().join("queued-stop.sqlite3"),
+        mock: true,
+        interactive_session: true,
+        objective: String::new(),
+        ..Config::default()
+    })
+    .await?;
+    let control = harness.control.clone();
+    let store = harness.store.clone();
+    let metrics = harness.metrics.clone();
+    control
+        .post_prompt("queued task must not run after stop".into())
+        .await?;
+    assert!(
+        control.is_busy(),
+        "committed queued prompt reserves the active session"
+    );
+    assert!(control
+        .request_navigation(SessionNavigation::New)
+        .await
+        .is_err());
+    control.stop_work().await?;
+    let run = tokio::spawn(harness.run());
+    wait_for_board(&store, "all workers drained; work stopped").await?;
+    assert!(store.unfinished_prompt().await?.is_none());
+    assert_eq!(
+        metrics.snapshot().tools,
+        0,
+        "stopped queued task cannot execute tools"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while control.is_busy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    control.request_navigation(SessionNavigation::New).await?;
+    tokio::time::timeout(Duration::from_secs(5), run).await???;
+    Ok(())
+}

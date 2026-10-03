@@ -73,8 +73,18 @@ struct AuthData {
     selection: Option<SavedSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launch: Option<LaunchProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    workspaces: BTreeMap<PathBuf, WorkspaceProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sessions: BTreeMap<PathBuf, WorkspaceProfile>,
     #[serde(default)]
     endpoints: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct WorkspaceProfile {
+    selection: SavedSelection,
+    launch: LaunchProfile,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -263,7 +273,47 @@ impl AuthStore {
         self.data.launch.as_ref()
     }
 
+    pub fn launch_profile_for(&self, workspace: &Path) -> Option<&LaunchProfile> {
+        self.data
+            .workspaces
+            .get(workspace)
+            .map(|entry| &entry.launch)
+            .or_else(|| {
+                self.data
+                    .launch
+                    .as_ref()
+                    .filter(|profile| profile.workspace == workspace)
+            })
+    }
+
+    pub fn selection_for(&self, workspace: &Path) -> Option<&SavedSelection> {
+        self.data
+            .workspaces
+            .get(workspace)
+            .map(|entry| &entry.selection)
+            .or(self.data.selection.as_ref())
+    }
+
+    pub fn launch_profile_for_session(&self, database: &Path) -> Option<&LaunchProfile> {
+        self.data.sessions.get(database).map(|entry| &entry.launch)
+    }
+
+    pub fn selection_for_session(&self, database: &Path) -> Option<&SavedSelection> {
+        self.data
+            .sessions
+            .get(database)
+            .map(|entry| &entry.selection)
+    }
+
     pub fn remember_launch(&mut self, config: &Config) {
+        let mut normalized = config.clone();
+        if let Ok(workspace) = fs::canonicalize(&normalized.workspace) {
+            normalized.workspace = workspace;
+        }
+        if let Ok(database) = fs::canonicalize(&normalized.database) {
+            normalized.database = database;
+        }
+        let config = &normalized;
         self.set_selection(&config.provider, &config.model, config.variant.as_deref());
         self.data.launch = Some(LaunchProfile {
             agents: config.agents,
@@ -283,6 +333,20 @@ impl AuthStore {
             grace_secs: config.grace_period.as_secs_f64(),
             config_path: config.config_path.clone(),
         });
+        self.data.workspaces.insert(
+            config.workspace.clone(),
+            WorkspaceProfile {
+                selection: self.data.selection.clone().expect("selection just saved"),
+                launch: self.data.launch.clone().expect("launch just saved"),
+            },
+        );
+        self.data.sessions.insert(
+            config.database.clone(),
+            WorkspaceProfile {
+                selection: self.data.selection.clone().expect("selection just saved"),
+                launch: self.data.launch.clone().expect("launch just saved"),
+            },
+        );
     }
 
     pub fn set_selection(&mut self, provider: &str, model: &str, variant: Option<&str>) {
@@ -557,6 +621,100 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_profiles_and_models_survive_switching_projects() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("auth.json");
+        let mut store = AuthStore::load_with_opencode(&path, None)?;
+        let first = Config {
+            workspace: directory.path().join("first"),
+            database: directory.path().join("first/history.sqlite3"),
+            provider: "anthropic".into(),
+            model: "claude-fixture".into(),
+            api_key: Some("must-not-be-saved-in-launch-profile".into()),
+            ..Config::default()
+        };
+        let second = Config {
+            workspace: directory.path().join("second"),
+            database: directory.path().join("second/history.sqlite3"),
+            provider: "openai".into(),
+            model: "gpt-fixture".into(),
+            ..Config::default()
+        };
+        store.remember_launch(&first);
+        store.remember_launch(&second);
+        let third = Config {
+            workspace: first.workspace.clone(),
+            database: directory.path().join("first/other-session.sqlite3"),
+            model: "other-session-model".into(),
+            ..Config::default()
+        };
+        store.remember_launch(&third);
+        store.save()?;
+        let restored = AuthStore::load_with_opencode(&path, None)?;
+        assert_eq!(
+            restored
+                .launch_profile_for(&first.workspace)
+                .unwrap()
+                .database,
+            third.database
+        );
+        assert_eq!(
+            restored.selection_for(&first.workspace).unwrap().model,
+            third.model
+        );
+        assert_eq!(
+            restored
+                .selection_for_session(&first.database)
+                .unwrap()
+                .model,
+            first.model
+        );
+        assert_eq!(
+            restored
+                .selection_for_session(&third.database)
+                .unwrap()
+                .model,
+            third.model
+        );
+        assert_eq!(
+            restored.selection_for(&second.workspace).unwrap().model,
+            second.model
+        );
+        assert!(restored
+            .launch_profile_for(&directory.path().join("third"))
+            .is_none());
+        assert!(!fs::read_to_string(path)?.contains("must-not-be-saved-in-launch-profile"));
+        Ok(())
+    }
+
+    #[test]
+    fn remembered_session_database_aliases_share_a_canonical_profile() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("nested"))?;
+        let database = directory.path().join("history.sqlite3");
+        fs::write(&database, "")?;
+        let mut auth = AuthStore::load_with_opencode(directory.path().join("auth.json"), None)?;
+        auth.remember_launch(&Config {
+            workspace: directory.path().to_owned(),
+            database: directory.path().join("nested/../history.sqlite3"),
+            model: "selected-after-launch".into(),
+            ..Config::default()
+        });
+        let canonical = fs::canonicalize(database)?;
+        assert_eq!(
+            auth.selection_for_session(&canonical).unwrap().model,
+            "selected-after-launch"
+        );
+        assert_eq!(
+            auth.launch_profile_for_session(&canonical)
+                .unwrap()
+                .database,
+            canonical
+        );
         Ok(())
     }
 

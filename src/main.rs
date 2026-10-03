@@ -53,6 +53,15 @@ enum Command {
     },
     /// Exercise real board, tool and consensus mechanics entirely offline.
     Demo(RunArgs),
+    /// List saved sessions in the current workspace, or across all workspaces.
+    Sessions {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Read the durable, unfiltered global board by sequence cursor.
     Board {
         #[arg(long, default_value = "openraid.sqlite3")]
@@ -103,6 +112,12 @@ struct RunArgs {
     /// Relative paths are resolved inside the selected workspace.
     #[arg(long)]
     database: Option<PathBuf>,
+    /// Start a separate session with a fresh database in this workspace.
+    #[arg(long = "new", conflicts_with_all = ["session", "resume", "database"])]
+    new_session: bool,
+    /// Open a saved session by ID, including one from another workspace.
+    #[arg(long, conflicts_with = "database")]
+    session: Option<String>,
     #[arg(long, env = "OPENRAID_PROVIDER")]
     provider: Option<String>,
     #[arg(long, env = "OPENRAID_MODEL")]
@@ -150,9 +165,46 @@ struct RunArgs {
 impl RunArgs {
     async fn config(self, mock: bool, force_setup: bool) -> Result<Option<Config>> {
         let auth = AuthStore::load_default()?;
-        let resume_home = force_setup && !self.select && auth.selection().is_some();
-        let profile = resume_home
-            .then(|| auth.launch_profile().cloned())
+        self.config_with_auth(mock, force_setup, auth).await
+    }
+
+    async fn config_with_auth(
+        self,
+        mock: bool,
+        force_setup: bool,
+        auth: AuthStore,
+    ) -> Result<Option<Config>> {
+        let requested_session = self
+            .session
+            .as_deref()
+            .map(openraid::session_catalog::find)
+            .transpose()?;
+        let selected_workspace = self
+            .workspace
+            .as_deref()
+            .or_else(|| {
+                requested_session
+                    .as_ref()
+                    .map(|entry| entry.workspace.as_path())
+            })
+            .unwrap_or(std::path::Path::new("."));
+        let workspace = tokio::fs::canonicalize(selected_workspace)
+            .await
+            .with_context(|| format!("opening workspace {}", selected_workspace.display()))?;
+        if let Some(entry) = &requested_session {
+            if entry.workspace != workspace {
+                bail!(
+                    "session {} belongs to {}; omit --workspace to open it",
+                    entry.id,
+                    entry.workspace.display()
+                );
+            }
+        }
+        let resume_home = (force_setup || requested_session.is_some())
+            && !self.select
+            && auth.selection_for(&workspace).is_some();
+        let mut profile = resume_home
+            .then(|| auth.launch_profile_for(&workspace).cloned())
             .flatten();
         let explicit_selection =
             self.provider.is_some() || self.model.is_some() || self.variant.is_some();
@@ -161,15 +213,7 @@ impl RunArgs {
         }
         let grace_period = Duration::try_from_secs_f64(self.grace_secs)
             .context("consensus grace is out of range")?;
-        let selected_workspace = self
-            .workspace
-            .as_deref()
-            .or_else(|| profile.as_ref().map(|profile| profile.workspace.as_path()))
-            .unwrap_or(std::path::Path::new("."));
-        let workspace = tokio::fs::canonicalize(selected_workspace)
-            .await
-            .with_context(|| format!("opening workspace {}", selected_workspace.display()))?;
-        let interactive = !mock && (force_setup || self.select);
+        let interactive = !mock && (force_setup || self.select || requested_session.is_some());
         let explicit_context_budget = self.context_budget.is_some();
         let objective = match (self.objective, self.objective_file) {
             (Some(text), _) => text,
@@ -178,20 +222,57 @@ impl RunArgs {
                 .with_context(|| format!("reading objective {}", path.display()))?,
             _ if mock => "Verify every swarm member can collaborate on the global board and agree on completion.".into(),
             _ if interactive => String::new(),
+            _ if requested_session.is_some() => String::new(),
             _ => bail!("provide an objective or --objective-file, or run openraid setup"),
         };
-        let database = self.database.unwrap_or_else(|| {
-            profile
-                .as_ref()
-                .filter(|profile| profile.workspace == workspace)
-                .map(|profile| profile.database.clone())
-                .unwrap_or_else(|| PathBuf::from("openraid.sqlite3"))
-        });
+        let latest = if force_setup
+            && !self.new_session
+            && requested_session.is_none()
+            && self.database.is_none()
+        {
+            openraid::session_catalog::list(Some(&workspace))?
+                .into_iter()
+                .next()
+        } else {
+            None
+        };
+        let database = self
+            .database
+            .or_else(|| {
+                requested_session
+                    .as_ref()
+                    .map(|entry| entry.database.clone())
+            })
+            .or_else(|| latest.map(|entry| entry.database))
+            .unwrap_or_else(|| {
+                if self.new_session {
+                    return workspace
+                        .join(".openraid")
+                        .join("sessions")
+                        .join(format!("{}.sqlite3", openraid::session_catalog::new_id()));
+                }
+                profile
+                    .as_ref()
+                    .filter(|profile| profile.workspace == workspace)
+                    .map(|profile| profile.database.clone())
+                    .unwrap_or_else(|| PathBuf::from("openraid.sqlite3"))
+            });
         let database = if database.is_absolute() {
             database
         } else {
             workspace.join(database)
         };
+        let database = if database.is_file() {
+            std::fs::canonicalize(&database)?
+        } else {
+            database
+        };
+        ensure_session_workspace(&workspace, &database)?;
+        if resume_home && !self.new_session {
+            if let Some(session_profile) = auth.launch_profile_for_session(&database) {
+                profile = Some(session_profile.clone());
+            }
+        }
         let config_path = self
             .config
             .or_else(|| {
@@ -208,7 +289,12 @@ impl RunArgs {
         } else {
             openraid::mcp::load(&workspace, config_path.as_deref())?
         };
-        let saved = auth.selection();
+        let saved = if self.new_session {
+            None
+        } else {
+            auth.selection_for_session(&database)
+        }
+        .or_else(|| auth.selection_for(&workspace));
         let qualified = self
             .model
             .as_deref()
@@ -373,7 +459,11 @@ impl RunArgs {
             configure_provider(&catalog, &mut config, self.protocol.as_deref())?;
         }
         config.validate()?;
-        enable_remembered_recovery(&mut config, resume_home).await?;
+        enable_remembered_recovery(
+            &mut config,
+            (resume_home || requested_session.is_some()) && !self.new_session,
+        )
+        .await?;
         Ok(Some(config))
     }
 }
@@ -386,6 +476,24 @@ async fn enable_remembered_recovery(config: &mut Config, remembered_home: bool) 
     {
         let store = Store::open(&config.database).await?;
         config.resume = store.unfinished_prompt().await?.is_some();
+    }
+    Ok(())
+}
+
+fn ensure_session_workspace(workspace: &std::path::Path, database: &std::path::Path) -> Result<()> {
+    if !database.is_file() {
+        return Ok(());
+    }
+    let database = std::fs::canonicalize(database)?;
+    if let Some(entry) = openraid::session_catalog::list(None)?
+        .into_iter()
+        .find(|entry| entry.database == database && entry.workspace != workspace)
+    {
+        bail!(
+            "this session belongs to {}; open it with --session {}",
+            entry.workspace.display(),
+            entry.id
+        );
     }
     Ok(())
 }
@@ -416,6 +524,39 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Run(args) => launch(args.config(false, false).await?).await,
         Command::Setup(args) => launch(args.config(false, true).await?).await,
         Command::Demo(args) => launch(args.config(true, false).await?).await,
+        Command::Sessions {
+            workspace,
+            all,
+            json: as_json,
+        } => {
+            let workspace = std::fs::canonicalize(workspace.unwrap_or_else(|| PathBuf::from(".")))
+                .context("opening workspace")?;
+            let sessions = openraid::session_catalog::list((!all).then_some(workspace.as_path()))?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&sessions)?);
+            } else if sessions.is_empty() {
+                println!(
+                    "No saved sessions{}. Start one with openraid setup or openraid setup --new.",
+                    if all {
+                        String::new()
+                    } else {
+                        format!(" in {}", workspace.display())
+                    }
+                );
+            } else {
+                for entry in sessions {
+                    println!(
+                        "{}  {}\n  {}\n  {}",
+                        entry.id,
+                        entry.title,
+                        entry.workspace.display(),
+                        entry.database.display()
+                    );
+                }
+                println!("\nOpen a session: openraid setup --session ID");
+            }
+            Ok(())
+        }
         Command::Providers {
             query,
             json: as_json,
@@ -524,11 +665,36 @@ async fn dispatch(cli: Cli) -> Result<()> {
 }
 
 async fn launch(config: Option<Config>) -> Result<()> {
-    if let Some(config) = config {
-        run(config).await
-    } else {
+    let Some(mut config) = config else {
         println!("Setup cancelled.");
-        Ok(())
+        return Ok(());
+    };
+    loop {
+        match run(config).await? {
+            None => return Ok(()),
+            Some((openraid::session::SessionNavigation::New, active)) => {
+                config = active;
+                config.database = config
+                    .workspace
+                    .join(".openraid")
+                    .join("sessions")
+                    .join(format!("{}.sqlite3", openraid::session_catalog::new_id()));
+                config.objective.clear();
+                config.resume = false;
+                config.interactive_session = true;
+            }
+            Some((openraid::session::SessionNavigation::Open(id), _)) => {
+                let cli = Cli::try_parse_from(["openraid", "setup", "--session", &id])?;
+                let Some(Command::Setup(args)) = cli.command else {
+                    unreachable!()
+                };
+                let Some(next) = args.config(false, true).await? else {
+                    println!("Setup cancelled.");
+                    return Ok(());
+                };
+                config = next;
+            }
+        }
     }
 }
 
@@ -1489,7 +1655,7 @@ fn resolve_live_selection(
     Ok(next)
 }
 
-async fn run(config: Config) -> Result<()> {
+async fn run(config: Config) -> Result<Option<(openraid::session::SessionNavigation, Config)>> {
     let no_tui = config.no_tui;
     let session = tui::SessionInfo {
         provider: config.provider.clone(),
@@ -1500,11 +1666,23 @@ async fn run(config: Config) -> Result<()> {
     let workspace = config.workspace.clone();
     let config_path = config.config_path.clone();
     let interactive_session = config.interactive_session;
-    let harness = Harness::new(config).await?;
+    let mut config = config;
+    if config.database.is_file() {
+        config.database = std::fs::canonicalize(&config.database)?;
+    }
+    ensure_session_workspace(&config.workspace, &config.database)?;
+    let harness = Harness::new(config.clone()).await?;
+    config.database = std::fs::canonicalize(&config.database)?;
+    openraid::session_catalog::register(&config.workspace, &config.database, &config.objective)?;
+    if !config.mock {
+        let mut auth = AuthStore::load_default()?;
+        auth.remember_launch(&config);
+        auth.save()?;
+    }
     if no_tui {
         let summary = harness.run().await?;
         println!("{}", serde_json::to_string_pretty(&summary)?);
-        return Ok(());
+        return Ok(None);
     }
     let store = harness.store.clone();
     let metrics = harness.metrics.clone();
@@ -1530,12 +1708,95 @@ async fn run(config: Config) -> Result<()> {
     }
     let summary = worker.await.context("swarm supervisor task failed")??;
     println!("{}", serde_json::to_string_pretty(&summary)?);
-    Ok(())
+    Ok(control.take_navigation().map(|navigation| {
+        let mut active = (*control.current().config).clone();
+        active.agents = control.members().len();
+        (navigation, active)
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remembered_workspace_never_overrides_invocation_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("old-project");
+        std::fs::create_dir(&old).unwrap();
+        let mut auth = empty_auth(temp.path());
+        auth.remember_launch(&Config {
+            workspace: std::fs::canonicalize(&old).unwrap(),
+            database: old.join("previous.sqlite3"),
+            config_path: Some(old.join("missing-old-config.json")),
+            ..Config::default()
+        });
+        let Some(Command::Setup(args)) = Cli::parse_from(["openraid", "setup", "--no-tui"]).command
+        else {
+            panic!("setup arguments")
+        };
+        // Mock lets this exercise the setup resolution without needing a TTY or provider.
+        let config = args
+            .config_with_auth(true, true, auth)
+            .await
+            .unwrap()
+            .unwrap();
+        let cwd = std::fs::canonicalize(".").unwrap();
+        assert_eq!(config.workspace, cwd);
+        assert_eq!(config.database, cwd.join("openraid.sqlite3"));
+        assert_eq!(config.config_path, None);
+    }
+
+    #[tokio::test]
+    async fn new_session_does_not_reuse_remembered_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(temp.path()).unwrap();
+        let mut auth = empty_auth(temp.path());
+        auth.remember_launch(&Config {
+            workspace: workspace.clone(),
+            database: workspace.join("old.sqlite3"),
+            ..Config::default()
+        });
+        let Some(Command::Setup(args)) = Cli::parse_from([
+            "openraid",
+            "setup",
+            "--new",
+            "--no-tui",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ])
+        .command
+        else {
+            panic!("setup arguments")
+        };
+        let config = args
+            .config_with_auth(true, true, auth)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(config
+            .database
+            .starts_with(workspace.join(".openraid").join("sessions")));
+        assert!(!config.resume);
+        assert!(!config.database.exists());
+    }
+
+    #[test]
+    fn conflicting_session_controls_are_rejected_by_cli() {
+        for args in [
+            vec!["openraid", "setup", "--new", "--resume"],
+            vec![
+                "openraid",
+                "setup",
+                "--new",
+                "--database",
+                "existing.sqlite3",
+            ],
+            vec!["openraid", "setup", "--new", "--session", "session-example"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 
     #[test]
     fn live_gitlab_launch_endpoint_survives_saved_connection_without_pinning_other_model_defaults(
