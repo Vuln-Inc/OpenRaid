@@ -1174,7 +1174,9 @@ require('node:readline').createInterface({input:process.stdin}).on('line', line 
                     "command":["node","--eval",script],"environment":{"INIT_LOG":log}
                 }))?)]), directory.path().to_owned());
                 tokio::join!(hub.prepare_enabled(), hub.prepare_enabled());
-                while !log.is_file() {
+                // Creating the file precedes appendFileSync's completed write.
+                // Wait for the entire readiness record, not just its directory entry.
+                while !std::fs::read_to_string(&log).is_ok_and(|content| content.ends_with('\n')) {
                     tokio::task::yield_now().await;
                 }
                 assert_eq!(std::fs::read_to_string(&log)?.lines().count(), 1);

@@ -778,6 +778,13 @@ async fn live_worker(
         if shutdown.requested() {
             break;
         }
+        // A board/membership transaction can commit while the vote lookup or
+        // compaction is awaited. In particular, clearing votes must not turn a
+        // parked voter into a request dispatched without the new join notice.
+        // Catch up again before admitting that next provider operation.
+        if shared.store.latest_seq().await? > cursor {
+            continue;
+        }
         let provider = active.provider.as_ref().context("missing provider")?;
         shared.metrics.set_status(id, AgentStatus::Thinking);
         let definitions = shared.tools.definitions();

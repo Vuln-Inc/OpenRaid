@@ -347,16 +347,8 @@ impl Session {
                     // The native PTY child is a session/process-group leader. Kill
                     // its group so shell children cannot retain the output slave
                     // indefinitely after their parent is explicitly terminated.
-                    use nix::{
-                        sys::signal::{killpg, Signal},
-                        unistd::Pid,
-                    };
-                    match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
-                        Ok(()) => {
-                            self.state.lock().unwrap_or_else(|e| e.into_inner()).killed = true
-                        }
-                        Err(nix::errno::Errno::ESRCH) => (),
-                        Err(error) => return Err(error).context("kill PTY process group"),
+                    if kill_process_group(pid)? {
+                        self.state.lock().unwrap_or_else(|e| e.into_inner()).killed = true;
                     }
                 } else if running {
                     child.kill().context("kill PTY process")?;
@@ -450,12 +442,39 @@ fn monitor_child(session: &Session, drain: JoinHandle<()>, permit: PtyPermit) {
             .unwrap_or_else(|e| e.into_inner())
             .output_error = Some("PTY output-drain thread panicked".to_owned());
     }
+    // Darwin can report terminal EOF as soon as the session leader exits even
+    // when a HUP-ignoring descendant survives. Once leader and terminal output
+    // are both finished, reap the remaining group before releasing capacity.
+    // Do this here rather than against an old completed session's reusable PID.
+    #[cfg(unix)]
+    if let Some(pid) = session.process_id {
+        if let Err(error) = kill_process_group(pid) {
+            session
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .output_error = Some(format!("clean up PTY process group: {error:#}"));
+        }
+    }
     drop(permit);
     session
         .state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .output_complete = true;
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> Result<bool> {
+    use nix::{
+        sys::signal::{killpg, Signal},
+        unistd::Pid,
+    };
+    match killpg(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error).context("kill PTY process group"),
+    }
 }
 
 fn drain_output(mut reader: Box<dyn Read + Send>, mut file: File, session: &Session) {

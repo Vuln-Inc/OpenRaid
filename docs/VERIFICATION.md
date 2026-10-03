@@ -165,6 +165,30 @@ bash /mnt/c/Users/Arda/Desktop/projeler/openraid/run.sh demo \
 All application and PTY-test children exited and were reaped; the verification
 did not change source files, global toolchain configuration, or Windows artifacts.
 
+### v1.0.0 native-release portability follow-up
+
+The first four-platform release gate identified a membership-admission race and
+platform differences that local Windows/Linux acceptance did not expose:
+
+- A membership change could revoke a waiting worker's vote after its board read.
+  Provider admission now checks the durable board cursor again, so it catches up
+  with the new global notice before dispatching its next request.
+- The held MCP stdio fixture now waits for a complete initialization-log record;
+  file creation alone did not prove the child's write had finished on macOS.
+- Unix PTY cleanup handles Darwin's early terminal EOF after the leader exits,
+  terminating any surviving process-group descendants before releasing capacity.
+  The regression checks the actual background PID, rather than assuming Linux's
+  output-slave lifetime on every Unix platform.
+- The large-input Unix fixture explicitly selects noncanonical input and waits
+  for that terminal mode. Windows still writes immediately, preserving coverage
+  of the ConPTY startup handshake without relying on Unix canonical-line limits.
+
+After these changes, the complete local Windows gate again passed **208 tests**
+with none failed or ignored, and warnings-denied all-target Clippy passed. The
+actual Linux PTY gate again passed **9/9**. Release publication additionally
+requires native tests, Clippy, Node tests, an optimized build, and a 500-worker
+smoke on Linux, Windows, macOS Intel, and macOS Apple Silicon.
+
 The earlier frozen gate passed 207 tests and the first Linux build took 2 min 34 s.
 The final direct gate adds one meaningful custom-endpoint regression, bringing
 the total to 208. Both platform artifacts were rebuilt after that routing fix.

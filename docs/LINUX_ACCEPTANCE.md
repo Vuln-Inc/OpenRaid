@@ -83,7 +83,9 @@ warnings. Rebuild time was **26.86s**; test execution was **0.42s**.
 Coverage uses the real OS backend and includes:
 
 - Native terminal handles, interaction, resize, and natural exit.
-- Immediate large input without a startup deadlock.
+- Large input without a writer deadlock; the release portability follow-up uses
+  an explicitly noncanonical Unix fixture, while Windows tests immediate input
+  before the ConPTY startup handshake.
 - Full persisted output exceeding 96 KiB with bounded, exact byte pagination.
 - Split Unicode codepoints recoverable through `content_hex`.
 - Shared registry and fresh-global-board enforcement before mutations.

@@ -327,7 +327,18 @@ async fn explicit_kill_reaps_background_group_after_shell_leader_already_exited(
     let workspace = WorkspaceTools::new(root.path(), 1).unwrap();
     let child = workspace.execute("pty_spawn", &json!({"program":"sh","args":["-c","trap '' HUP; sleep 600 & printf 'BACKGROUND_READY:%s\\n' \"$!\"; exit 0"]})).await.unwrap();
     let id = child["id"].as_str().unwrap();
-    read_until(&workspace, id, "BACKGROUND_READY:").await;
+    let ready = read_until(&workspace, id, "BACKGROUND_READY:").await;
+    let pid: u32 = ready["content"]
+        .as_str()
+        .unwrap()
+        .split("BACKGROUND_READY:")
+        .nth(1)
+        .unwrap()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let page = workspace
@@ -335,10 +346,8 @@ async fn explicit_kill_reaps_background_group_after_shell_leader_already_exited(
                 .await
                 .unwrap();
             if page["exit_code"] == 0 {
-                assert_eq!(
-                    page["output_complete"], false,
-                    "background child must retain the terminal to exercise leader-exited cleanup"
-                );
+                // Linux retains the output slave; Darwin may instead signal
+                // EOF and complete cleanup before explicit kill is requested.
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -354,6 +363,7 @@ async fn explicit_kill_reaps_background_group_after_shell_leader_already_exited(
     .expect("kill must terminate background PTY holders after leader exit")
     .unwrap();
     assert_eq!(killed["output_complete"], true);
+    assert_reaped(pid).await;
     assert_eq!(
         workspace.execute("pty_list", &json!({})).await.unwrap()["sessions"],
         json!([])
@@ -361,13 +371,25 @@ async fn explicit_kill_reaps_background_group_after_shell_leader_already_exited(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn immediate_large_input_does_not_deadlock_native_startup_handshake() {
+async fn large_input_does_not_deadlock_terminal_writer_or_native_startup() {
     let root = tempfile::tempdir().unwrap();
     let workspace = WorkspaceTools::new(root.path(), 1).unwrap();
-    let child = workspace.execute("pty_spawn", &child_args()).await.unwrap();
+    let mut args = child_args();
+    if cfg!(unix) {
+        // Canonical terminals have OS-specific line limits (particularly on
+        // Darwin). Large-write coverage needs an explicitly noncanonical child.
+        args["command"] = json!(format!(
+            "stty -icanon -echo; {}",
+            args["command"].as_str().unwrap()
+        ));
+    }
+    let child = workspace.execute("pty_spawn", &args).await.unwrap();
     let id = child["id"].as_str().unwrap();
-    // Deliberately do not wait for readiness/output. More than the pipe input
-    // buffer exercises input-before-ConPTY-bootstrap writer contention.
+    if cfg!(unix) {
+        read_until(&workspace, id, "PTY_READY_END").await;
+    }
+    // On Windows deliberately do not wait for readiness/output. More than the
+    // pipe input buffer exercises input-before-ConPTY-bootstrap contention.
     let input = format!("early:{}\r\nquit\r\n", "x".repeat(32 * 1024));
     tokio::time::timeout(
         Duration::from_secs(20),
