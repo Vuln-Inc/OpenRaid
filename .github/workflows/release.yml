@@ -93,5 +93,9 @@ jobs:
           cat *.sha256 | sort -k2 > SHA256SUMS
           sha256sum --check SHA256SUMS
           cd ..
-          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.tar.gz dist/SHA256SUMS --verify-tag --draft --title "openraid $GITHUB_REF_NAME" --notes-file "docs/releases/$GITHUB_REF_NAME.md"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.tar.gz dist/SHA256SUMS --verify-tag --draft --title "openraid $GITHUB_REF_NAME" --notes-file "docs/releases/$GITHUB_REF_NAME.md"
+          fi
           gh release edit "$GITHUB_REF_NAME" --draft=false --latest
