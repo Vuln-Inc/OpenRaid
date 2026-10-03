@@ -1,0 +1,40 @@
+[package]
+name = "openraid"
+version = "1.0.0"
+edition = "2021"
+description = "Single-process native Tokio multi-agent swarm harness"
+authors = ["ardadl <153114611+ardadl@users.noreply.github.com>"]
+repository = "https://github.com/Vuln-Inc/openraid"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures-util = "0.3"
+globset = "0.4"
+ignore = "0.4"
+json5 = "0.4"
+portable-pty = "0.9"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+reqwest_mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+rmcp = { version = "3.5", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sse-stream = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "io-util", "process", "net"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", features = ["signal", "process"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

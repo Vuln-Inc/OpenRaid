@@ -1,0 +1,57 @@
+//! Openraid runs a global-board swarm as lightweight asynchronous tasks.
+
+// Domain folders keep related implementation together while these explicit
+// paths preserve the public module names used by the CLI and downstream callers.
+#[path = "credentials/auth.rs"]
+pub mod auth;
+#[path = "credentials/azure_oauth.rs"]
+pub mod azure_oauth;
+#[path = "providers/catalog.rs"]
+pub mod catalog;
+#[path = "terminal/clipboard.rs"]
+pub mod clipboard;
+pub mod config;
+#[path = "swarm/context.rs"]
+pub mod context;
+#[path = "credentials/gitlab_oauth.rs"]
+pub mod gitlab_oauth;
+#[path = "workspace/mcp.rs"]
+pub mod mcp;
+#[path = "swarm/metrics.rs"]
+pub mod metrics;
+#[path = "credentials/oauth.rs"]
+pub mod oauth;
+#[path = "providers/provider.rs"]
+pub mod provider;
+#[path = "providers/provider_settings.rs"]
+pub mod provider_settings;
+#[path = "providers/provider_wire.rs"]
+pub mod provider_wire;
+#[path = "terminal/pty.rs"]
+pub mod pty;
+#[path = "terminal/quick.rs"]
+pub mod quick;
+#[path = "swarm/runtime.rs"]
+pub mod runtime;
+#[path = "providers/sdk_bridge.rs"]
+pub mod sdk_bridge;
+#[path = "swarm/session.rs"]
+pub mod session;
+#[path = "terminal/setup.rs"]
+pub mod setup;
+#[path = "persistence/snapshots.rs"]
+pub mod snapshots;
+#[path = "credentials/snowflake_oauth.rs"]
+pub mod snowflake_oauth;
+#[path = "persistence/storage.rs"]
+pub mod storage;
+#[path = "workspace/tools.rs"]
+pub mod tools;
+#[path = "terminal/tui.rs"]
+pub mod tui;
+#[path = "terminal/tui_menu.rs"]
+pub mod tui_menu;
+#[path = "providers/variants.rs"]
+pub mod variants;
+#[path = "workspace/workspace.rs"]
+pub mod workspace;

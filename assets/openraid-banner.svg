@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" fill="none">
+  <title>openraid by vuln.industries</title>
+  <desc>One native runtime, a collaborative agent swarm, and one durable global board.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1200" y2="360" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#101B2B"/><stop offset="1" stop-color="#172C3B"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="76" y1="108" x2="164" y2="196" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A8B8FF"/><stop offset="1" stop-color="#79C9BB"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="360" rx="24" fill="url(#background)"/>
+  <rect x=".5" y=".5" width="1199" height="359" rx="23.5" stroke="#34475E"/>
+  <path d="M720 1V359M1 288H719" stroke="#34475E" stroke-opacity=".55"/>
+  <text x="64" y="59" fill="#8FA3B8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12" letter-spacing="3">NATIVE COLLABORATIVE AGENT HARNESS</text>
+  <path d="M97 114 74 138v39l23 24M143 114l23 24v39l-23 24" stroke="url(#accent)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M111 135h20v45h-20z" fill="url(#accent)"/>
+  <text x="190" y="178" fill="#E2EBF2" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-weight="700" font-size="76" letter-spacing="-4">openraid</text>
+  <text x="194" y="209" fill="#79C9BB" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="15">by vuln.industries</text>
+  <text x="66" y="260" fill="#B6C7D5" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" font-size="20">Many agents. Shared context. Visible progress.</text>
+  <text x="66" y="327" fill="#8FA3B8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">RUST / TOKIO</text>
+  <circle cx="216" cy="322" r="2" fill="#79C9BB"/>
+  <text x="235" y="327" fill="#8FA3B8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">UP TO 500 AGENTS</text>
+  <circle cx="430" cy="322" r="2" fill="#79C9BB"/>
+  <text x="449" y="327" fill="#8FA3B8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">ONE GLOBAL BOARD</text>
+  <rect x="762" y="46" width="388" height="266" rx="12" fill="#101D2D" stroke="#3A4E68"/>
+  <path d="M763 84h386" stroke="#3A4E68"/>
+  <circle cx="784" cy="65" r="4" fill="#79C9BB"/>
+  <circle cx="801" cy="65" r="4" fill="#A8B8FF"/>
+  <circle cx="818" cy="65" r="4" fill="#E8BA78"/>
+  <text x="970" y="69" fill="#8FA3B8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="11">SHARED RUNTIME</text>
+  <rect x="786" y="109" width="158" height="36" rx="6" fill="#1C3144"/>
+  <text x="801" y="132" fill="#E2EBF2" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">agent-001</text>
+  <circle cx="925" cy="127" r="4" fill="#79C9BB"/>
+  <rect x="786" y="157" width="158" height="36" rx="6" fill="#1C3144"/>
+  <text x="801" y="180" fill="#E2EBF2" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">agent-002</text>
+  <circle cx="925" cy="175" r="4" fill="#A8B8FF"/>
+  <rect x="786" y="205" width="158" height="36" rx="6" fill="#1C3144"/>
+  <text x="801" y="228" fill="#E2EBF2" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">agent-...</text>
+  <circle cx="925" cy="223" r="4" fill="#E8BA78"/>
+  <path d="M945 127h26v96h-26M972 175h22" stroke="#607796" stroke-width="2"/>
+  <rect x="994" y="123" width="130" height="104" rx="8" fill="#183A3B" stroke="#79C9BB" stroke-opacity=".55"/>
+  <text x="1014" y="152" fill="#79C9BB" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">GLOBAL</text>
+  <text x="1014" y="174" fill="#E2EBF2" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="13">BOARD</text>
+  <path d="M1015 192h87M1015 203h65" stroke="#79C9BB" stroke-opacity=".4" stroke-width="3" stroke-linecap="round"/>
+  <text x="786" y="280" fill="#8FA3B8" font-family="ui-monospace, SFMono-Regular, Consolas, monospace" font-size="12">PTY + MCP + DURABLE CHECKPOINTS</text>
+</svg>
