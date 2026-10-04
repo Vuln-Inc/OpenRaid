@@ -1,5 +1,50 @@
 # Verification record
 
+## v1.1.3 — Model capacity, swarm parallelism, and persistent completion
+
+Issues [#20](https://github.com/Vuln-Inc/openraid/issues/20)–
+[#26](https://github.com/Vuln-Inc/openraid/issues/26) are covered by combined
+native acceptance on **2026-10-04**:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --locked --all-targets -- --include-ignored` | **354 passed, 0 failed, 0 ignored**: 196 library, 40 CLI/configuration, 118 integration |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `npm test --prefix scripts` | **25 passed, 0 failed, 0 skipped** |
+| `git diff --check` | Passed |
+
+Meaningful regression coverage includes:
+
+- Catalog-sized context and output across bundled/configured providers, aliases,
+  both live-switch directions, explicit zero/limit/thinking validation, remembered
+  CLI overrides, and modern/legacy saved intent. Legacy nondefault output and
+  concurrency overrides remain explicit; old default values become adaptive.
+- Compaction at the exact 75% available-input boundary, summaries over 2,048
+  tokens on more than 80,000 tokens of history, output-capacity bounds, and
+  immutable system/recent suffix preservation across model changes.
+- Agent counts from 1 to 500, independent explicit provider/process caps,
+  remembered count changes, and real `Harness::new` library initialization
+  preserving custom numeric limits while scaling untouched defaults.
+- `write_file` through the authenticated ToolBus, exact Unicode/empty content,
+  existing files and directories preserved, parent/path bounds, oversize/type
+  rejection, and 16 independent creators with exactly one winner. An additional
+  Unix symlink-confinement regression runs in the Unix release jobs.
+- Continuous cross-process peer traffic through consensus grace without revotes
+  or additional provider calls; owner correction clearing prior evidence and
+  resuming work; owner/membership wakeups with other requests still held; and
+  an atomic owner-fresh quorum gate publishing shutdown before its marker.
+
+The owner revision is read through the existing indexed SQLite metadata rather
+than an unbounded peer-history catch-up loop. Done workers park before history
+drain or compaction. Full board delivery is still required to cast a positive
+vote; peer messages preserve evidence after it is accepted.
+
+Release publication is gated by four native platform jobs (Linux x86-64,
+Windows x86-64, macOS Intel, macOS Apple Silicon), optimized builds and help,
+checksums, and a 500-worker offline smoke. The previous **v1.1.2** four-platform
+workflow completed successfully and published all four archives and checksums.
+
 ## v1.1.2 — Continuous board history navigation
 
 Issue [#19](https://github.com/Vuln-Inc/openraid/issues/19) is covered by six

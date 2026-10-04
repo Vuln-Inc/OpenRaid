@@ -138,17 +138,16 @@ worker quits once. The final roster has **two active members and three drained
 workers**. Coherent revision/roster snapshot stress coverage is complementary
 storage evidence recorded in the full verification record.
 
-### 10. Owner, peer, and membership work wake already-voted workers
+### 10. Owner and membership steering wake voters; peer chatter preserves votes
 
-`waiting_voted_workers_wake_for_owner_peer_and_membership_work_without_waiting_for_other_requests`
+`waiting_voted_workers_ignore_peers_and_wake_for_owner_and_membership_work_without_waiting_for_other_requests`
 
 Two workers first vote and wait while a third real HTTP request remains held,
-preventing the three-member quorum. Both waiting workers dispatch again after
-each exact **owner entry**, **peer entry**, and **membership notice**, receiving
-the new unfiltered history before their request. A fourth collaborator joins,
-and the four-member dynamic quorum cannot complete while two requests are held.
-Releasing admitted requests then drains all four workers. No arbitrary consensus
-grace delay is needed to manufacture the wakeup ordering.
+preventing the three-member quorum. Owner steering wakes both voters, while an
+ordinary peer entry preserves their exact vote rows and starts no provider work.
+A membership notice wakes them again with full unfiltered history. A fourth
+collaborator joins, and the four-member quorum cannot complete while two requests
+remain held. Releasing admitted requests then drains all four workers.
 
 ## Interpretation boundaries
 

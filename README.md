@@ -7,10 +7,10 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.1.2-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.2)
+[![Version](https://img.shields.io/badge/version-1.1.3-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.3)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
-[![Verification](https://img.shields.io/badge/verified-322%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
+[![Verification](https://img.shields.io/badge/verified-354%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
 [**Quick start**](#install-and-launch) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
@@ -140,12 +140,12 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.1.2 archive |
+| Platform | v1.1.3 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.1.2-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.1.2-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.1.2-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.1.2-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.1.3-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.1.3-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.1.3-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.1.3-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
 
@@ -453,9 +453,9 @@ In `/members` or `/remove`, use `Space` to mark agents and `Ctrl+A` to toggle al
 
 1. Every agent receives the shared objective and its own logical identity.
 2. Agents read the ordered board, discuss their work, and use native tools. They actively negotiate how to divide the objective so multiple agents can build concurrently; avoiding duplicated work does not mean waiting. Board coordination is advisory for workspace and MCP tools: new peer messages do not block execution. Only positive completion votes require a fully current board cursor.
-3. Workers can cast or withdraw a completion vote with evidence. Voting does not terminate a worker.
-4. Completion requires **at least 75% of the active roster**, rounded up, with evidence current to the latest global board revision.
-5. New messages, withdrawn votes, or membership changes reset the stability grace. Once the gate commits, the harness drains workers and records their exit notices.
+3. Workers cast or withdraw completion votes with evidence. A done worker parks without further provider requests or peer-history compaction until new owner steering or harness completion.
+4. Completion requires **at least 75% of the active roster**, rounded up, with evidence covering the latest owner instruction. Ordinary peer chatter preserves existing votes and the stability grace.
+5. New owner instructions or controls, withdrawn quorum votes, and membership changes reset consensus stability. Once the gate commits, the harness drains workers and records their exit notices.
 
 `--grace-secs` controls consensus stability. Requests, commands, and PTYs have **no duration-based aborts**. Transient provider failures use retry backoff; new work, model selection, or retirement can wake the relevant waiting workers.
 
@@ -488,10 +488,13 @@ These are tools available to model workers, not additional CLI subcommands:
 | --- | --- |
 | `board_read`, `board_post`, `vote_done` | Read shared history, coordinate, and cast/withdraw completion evidence |
 | `read_file`, `list_files`, `search_files` | Inspect workspace files; regex search is case-sensitive |
+| `write_file` | Create a new UTF-8 file from `path` and `content`; existing targets are refused |
 | `apply_patch` | Apply exact-context additions, edits, deletions, and moves |
 | `run_command` | Run an executable or shell command with full disk-backed output |
 | `pty_spawn`, `pty_write`, `pty_read` | Start and interact with a persistent native terminal |
 | `pty_resize`, `pty_list`, `pty_kill` | Resize, inspect, or explicitly terminate/clean a terminal session |
+
+`write_file` creates missing parent directories and atomically claims a new file, so simultaneous writers cannot overwrite each other. Content is limited to 4 MiB; use `apply_patch` for edits to an existing target.
 
 Windows uses **ConPTY**; Unix-like systems use native PTYs. All agents share the PTY registry and `--max-processes` capacity with ordinary commands. If persistent PTYs occupy every slot, admission returns cleanup guidance so workers can free capacity instead of becoming stranded.
 
@@ -559,10 +562,10 @@ Search fields can match names flexibly, but exact selections and configuration v
 | `--variant` | Saved/model selection | Model-specific thinking override; `default` removes it |
 | `--base-url` | Selected provider/model endpoint | Override the API base, not a complete request route |
 | `--protocol` | Selected adapter | `chat`, `responses`, `anthropic`, `gemini`, or `sdk` |
-| `--max-in-flight` | `32` | Shared provider request concurrency |
-| `--max-processes` | `4` | Shared ordinary-command and PTY capacity |
-| `--context-budget` | Codex model limit; otherwise `32000` | Context budget used by the compaction heuristic |
-| `--max-output-tokens` | `4096` | Output reserve, capped to supported limits and below context |
+| `--max-in-flight` | `max(32, agents)` | Shared provider request concurrency; explicit limits are preserved |
+| `--max-processes` | `max(4, agents)` | Shared command and PTY capacity; default 8-agent launch has 8 slots |
+| `--context-budget` | Selected model context limit; `32000` if unknown | All-provider context capacity; explicit smaller budgets are preserved |
+| `--max-output-tokens` | Selected model output limit; `16384` if unknown | Output/reasoning reserve, capped to supported limits and usable context |
 | `--grace-secs` | `5` | Completion-quorum stability grace |
 | `--config` | First supported workspace config | Explicit provider/MCP JSON or JSONC file |
 | `--provider-options` | `{}` | JSON provider/generation options |
@@ -574,6 +577,8 @@ Search fields can match names flexibly, but exact selections and configuration v
 | `--no-tui` | Off | Headless execution; also automatic without interactive stdin/stdout |
 
 Remembered setup preferences can change initial values. Flags override their corresponding environment variables. Use `run --help` to inspect the complete CLI.
+
+Implicit model budgets are recalculated on model selection and session reopening. If the output allowance would consume the entire context, it is reduced to one quarter of that context to retain input headroom. Compaction starts around 75% of available input capacity; its continuation summary scales to one eighth of that capacity, bounded by the model's output allowance.
 
 ### Environment variables
 
@@ -666,7 +671,7 @@ Checkpoint recovery does not make arbitrary filesystem or subprocess effects exa
 | Agent shows an oversized/blocked context | Inspect its detail, choose suitable model/context capacity, or shorten the new objective; full board history remains durable |
 | Native command cannot get capacity | Inspect `pty_list` and explicitly clean unneeded persistent PTYs |
 | MCP stays connecting | Inspect its command/URL/authentication; disable/retry through `/mcp`. Other provider workers can continue |
-| Completion votes reset | New owner/peer messages or membership changes made their evidence stale; this is expected |
+| Completion votes reset | New owner steering or membership controls invalidate prior evidence; ordinary peer chatter preserves done votes |
 | Final exit waits | Graceful close or consensus may still be draining a request/tool; use `/stop` for immediate cancellation while the console is open |
 | Reopen uses an old selection | Choose another model with `/models`, or start `run --select` to repeat guided selection |
 
@@ -676,7 +681,7 @@ The recorded acceptance gate includes:
 
 | Check | Recorded result |
 | --- | --- |
-| Rust, including optional integration fixtures | **316 passed on Windows**, none failed or ignored |
+| Rust, including optional integration fixtures | **354 passed on Windows**, none failed or ignored |
 | Node SDK/transport/discovery tests | **25 passed** |
 | Native PTY tests | **8 Windows ConPTY cases; 9 Unix cases** |
 | OpenCode source audit | **23 custom loaders and 24 upstream adapter entries** accounted for |

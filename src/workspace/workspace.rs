@@ -7,7 +7,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
@@ -149,6 +149,7 @@ impl WorkspaceTools {
                 "read_file" => this.read_file(&args, generation),
                 "list_files" => this.list_files(&args, generation),
                 "search_files" => this.search_files(&args, generation),
+                "write_file" => this.write_file(&args, generation),
                 "apply_patch" => this.apply_patch(&args, generation),
                 _ => bail!("unknown workspace tool: {name}"),
             }
@@ -207,6 +208,7 @@ impl WorkspaceTools {
                 "offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":1000},
                 "include_ignored":{"type":"boolean"}
             }), &["query"]),
+            tool("write_file", "Create a new UTF-8 file from path and content, creating missing parent directories. Atomically refuses existing files; use apply_patch to modify them. Content is limited to 4 MiB. Coordinate new files on the global board before creation.", json!({"path":{"type":"string"}, "content":{"type":"string"}}), &["path", "content"]),
             tool("apply_patch", "Apply an exact-context patch: *** Begin Patch, *** Add File/Update File/Delete File, optional *** Move to, @@ hunks with space context/+ additions/- deletions, *** End Patch. All changes preflight before writes; re-read and coordinate on the global board before edits.", json!({"patch":{"type":"string"}}), &["patch"]),
             tool("run_command", "Execute an executable with args, or a shell command, in the workspace. No duration timeout. stdout/stderr are fully persisted with bounded previews; read the returned log paths for the remainder. Shell defaults to PowerShell on Windows and sh elsewhere.", json!({
                 "program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},
@@ -450,6 +452,60 @@ impl WorkspaceTools {
         Ok(
             json!({"matches":matches,"offset":offset,"next_offset":offset+matches.len(),
             "has_more":has_more,"skipped_binary_or_large_files":skipped}),
+        )
+    }
+
+    fn write_file(&self, args: &Value, generation: u64) -> Result<Value> {
+        self.check_generation(generation)?;
+        let input = required_str(args, "path")?;
+        let content = required_str(args, "content")?;
+        if content.len() > TEXT_BYTES {
+            bail!("file content exceeds 4 MiB");
+        }
+        let path = self.resolve(input)?;
+        if fs::symlink_metadata(&path).is_ok() {
+            bail!("file already exists: {input}; use apply_patch to modify existing files");
+        }
+        if let Some(parent) = path.parent() {
+            self.check_generation(generation)?;
+            fs::create_dir_all(parent)?;
+        }
+        // Recheck confinement after parent creation, then reserve the file in
+        // the filesystem itself. An exists()/write() pair could overwrite a
+        // file another worker created between those two operations.
+        let path = self.resolve(input)?;
+        self.check_generation(generation)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    anyhow!(
+                        "file already exists: {input}; use apply_patch to modify existing files"
+                    )
+                } else {
+                    anyhow!(error).context(format!("create file: {input}"))
+                }
+            })?;
+        let result = (|| -> Result<()> {
+            for chunk in content.as_bytes().chunks(8192) {
+                self.check_generation(generation)?;
+                file.write_all(chunk)?;
+            }
+            self.check_generation(generation)?;
+            file.flush()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(error) = result {
+            // Only this operation created the file. A cancelled or failed write
+            // must not leave a partial file that blocks the next creation.
+            fs::remove_file(&path).context("remove incomplete newly created file")?;
+            return Err(error);
+        }
+        Ok(
+            json!({"path":relative(&self.root, &path), "bytes_written":content.len(), "created":true}),
         )
     }
 

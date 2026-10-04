@@ -1,5 +1,5 @@
-//! Fresh peer messages and cross-process owner corrections must return voted
-//! live workers to model coordination before fresh completion can be accepted.
+//! Cross-process owner corrections return parked voters to coordination, while
+//! ordinary peer traffic preserves their already-verified completion evidence.
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
@@ -60,7 +60,8 @@ async fn wait_for_fresh_vote(store: &Store, expected_seq: u64) -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn voted_live_agent_reconsiders_external_peer_and_owner_messages() -> Result<()> {
+async fn voted_live_agent_preserves_peer_evidence_and_reconsiders_external_owner_messages(
+) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let database = directory.path().join("reconsideration.sqlite");
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -69,8 +70,7 @@ async fn voted_live_agent_reconsiders_external_peer_and_owner_messages() -> Resu
         agents: 1,
         workspace: directory.path().to_owned(),
         database: database.clone(),
-        objective: "reconsider every global peer blocker and owner correction before completion"
-            .into(),
+        objective: "preserve completion votes until authenticated owner corrections".into(),
         base_url: format!("http://{address}/v1"),
         grace_period: Duration::from_secs(1),
         no_tui: true,
@@ -82,13 +82,12 @@ async fn voted_live_agent_reconsiders_external_peer_and_owner_messages() -> Resu
     let server_store = store.clone();
     let server = async move {
         let mut observations = Vec::new();
-        for index in 0..3 {
+        for index in 0..2 {
             let (mut socket, _) = listener.accept().await?;
             let request = read_request(&mut socket).await?;
             observations.push((request, server_store.vote("agent-001").await?));
             let evidence = match index {
                 0 => "verified original objective",
-                1 => "reconsidered external peer blocker and verified revised completion",
                 _ => "reconsidered external owner correction and verified final completion",
             };
             let body = json!({
@@ -120,7 +119,14 @@ async fn voted_live_agent_reconsiders_external_peer_and_owner_messages() -> Resu
                 false,
             )
             .await?;
-        wait_for_fresh_vote(&store, peer.seq).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        ensure!(
+            store
+                .vote("agent-001")
+                .await?
+                .is_some_and(|vote| vote.done && vote.board_seq == 1),
+            "peer chatter must not replace or revoke completed evidence"
+        );
         let owner = external
             .append(
                 "owner",
@@ -131,23 +137,23 @@ async fn voted_live_agent_reconsiders_external_peer_and_owner_messages() -> Resu
         wait_for_fresh_vote(&store, owner.seq).await?;
         Ok::<_, anyhow::Error>((peer.seq, owner.seq))
     };
-    let (run, injections, observations) = tokio::join!(harness.run(), inject, server);
+    let (run, injections, observations) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(harness.run(), inject, server)
+    })
+    .await
+    .context("owner reconsideration did not complete")?;
     let summary = run?;
     let (peer_seq, owner_seq) = injections?;
     let observations = observations?;
 
     assert_eq!((summary.finished_agents, summary.votes), (1, 1));
-    assert_eq!(observations.len(), 3);
+    assert_eq!(observations.len(), 2);
     let peer_history = observations[1].0["messages"].to_string();
     assert!(peer_history.contains("external peer blocker requires reconsideration"));
-    assert!(
-        observations[1].1.as_ref().is_some_and(|vote| !vote.done),
-        "stale peer evidence must be withdrawn before requesting reconsideration"
-    );
-    let owner_history = observations[2].0["messages"].to_string();
+    let owner_history = observations[1].0["messages"].to_string();
     assert!(owner_history.contains("external owner correction requires fresh verification"));
     assert!(
-        observations[2].1.is_none(),
+        observations[1].1.is_none(),
         "external owner insertion must atomically clear old votes"
     );
     let final_vote = store

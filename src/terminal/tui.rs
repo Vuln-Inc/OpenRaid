@@ -1323,9 +1323,9 @@ async fn run_console(
                     refresh_mcp_menu(&mut app, &manager.control.mcp);
                     app.member_count = Some(members.len());
                     app.draining_count = manager.control.draining_members().len();
-                    let latest = store.latest_seq().await?;
+                    let owner_revision = store.latest_owner_seq().await?;
                     app.current_votes = Some(store.votes().await?.iter().filter(|vote| {
-                        vote.done && vote.board_seq == latest && members.contains(&vote.agent_id)
+                        vote.done && vote.board_seq >= owner_revision && members.contains(&vote.agent_id)
                     }).count());
                 }
                 if board_dirty {

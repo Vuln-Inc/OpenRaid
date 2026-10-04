@@ -188,7 +188,7 @@ impl ContextWindow {
             .max_tokens
             .saturating_sub(self.config.reserve_output_tokens);
         // Start before the absolute ceiling to leave room for the next tool result.
-        let trigger = available.saturating_mul(85) / 100;
+        let trigger = available.saturating_mul(75) / 100;
         if (!forced && self.estimated_tokens() <= trigger) || self.history.len() < 3 {
             return None;
         }
@@ -388,9 +388,11 @@ pub fn swarm_system_prompt(objective: &str, workspace: &str, agents: usize) -> A
          or post a concrete blocker and what would resolve it; do not silently idle.\n\n\
          COMPLETION\n\
          Do not quit autonomously. Vote done only after posting evidence that the shared objective \
-         is complete and after checking the whole board. Retract your vote when new work or owner \
-         corrections appear. The harness hard-gates termination through swarm consensus and a \
-         grace period. Continue coordinating until the harness stops the swarm."
+          is complete and after checking the whole board. Reconsider your vote when new owner \
+          corrections require reconsideration. Ordinary peer chatter does not invalidate your vote. \
+          After voting done, the harness parks you until consensus or a new owner instruction \
+          resumes your work. The harness hard-gates termination through swarm consensus and a \
+          grace period."
     ))
 }
 
@@ -408,6 +410,8 @@ mod tests {
             prompt.contains("only positive completion votes require a fully current board cursor")
         );
         assert!(prompt.contains("Read the shared global board immediately and frequently"));
+        assert!(prompt.contains("Ordinary peer chatter does not invalidate your vote"));
+        assert!(prompt.contains("After voting done, the harness parks you until consensus"));
     }
 
     fn window() -> ContextWindow {
@@ -424,6 +428,41 @@ mod tests {
 
     fn text(role: &str, n: usize) -> Value {
         json!({"role": role, "content": "x".repeat(n)})
+    }
+
+    #[test]
+    fn proactive_compaction_starts_after_three_quarters_of_available_input() {
+        let mut context = ContextWindow::new(
+            Arc::from("immutable system"),
+            ContextConfig {
+                max_tokens: 10_000,
+                reserve_output_tokens: 2_000,
+                retain_recent_tokens: 80,
+                summary_max_tokens: 40,
+            },
+        );
+        let recent = [text("assistant", 40), text("user", 40)];
+        let baseline = context.system_tokens()
+            + estimate_message_tokens(&text("user", 0))
+            + recent.iter().map(estimate_message_tokens).sum::<usize>();
+        context.push(text("user", (6_000 - baseline) * 3));
+        for message in recent {
+            context.push(message);
+        }
+        assert_eq!(context.available_tokens(), 8_000);
+        assert_eq!(context.estimated_tokens(), 6_000);
+        assert!(context.compaction_plan().is_none());
+
+        context.push(text("assistant", 40));
+        let original = context.messages();
+        let plan = context
+            .compaction_plan()
+            .expect("compact above 75%, before the former 85% threshold");
+        assert!(context.estimated_tokens() < 6_800);
+        context.apply_summary(&plan, "objective retained").unwrap();
+        let compacted = context.messages();
+        assert_eq!(compacted[0], original[0]);
+        assert_eq!(&compacted[2..], &original[plan.prefix_len + 1..]);
     }
 
     #[test]

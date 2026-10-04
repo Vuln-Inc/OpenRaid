@@ -655,6 +655,18 @@ impl Store {
         self.call(|connection| latest_cursor(connection)).await
     }
 
+    /// Owner instructions and controls invalidate votes; peer chatter does not.
+    pub async fn latest_owner_seq(&self) -> Result<u64> {
+        self.call(|connection| {
+            Ok(connection.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM board WHERE owner = 1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
     /// An atomic, unpaginated snapshot for operator export.
     pub async fn export_board(&self) -> Result<Vec<BoardMessage>> {
         self.call(|connection| {
@@ -803,7 +815,7 @@ impl Store {
     }
 
     /// Atomically gate completion and publish its marker. Only known voters
-    /// whose evidence covers the latest global cursor count. An external owner
+    /// whose evidence covers the latest owner instruction count. An external owner
     /// append either precedes this transaction and revokes quorum, or follows
     /// the committed gate; it cannot interleave the check and marker insertion.
     pub async fn try_commit_consensus(
@@ -816,9 +828,9 @@ impl Store {
             .await
     }
 
-    /// Bind the atomic gate to the exact global cursor whose quorum remained
-    /// stable through the grace period. Even freshly revalidated votes cannot
-    /// commit under grace earned for an older board revision.
+    /// Bind the atomic gate to the owner revision observed during the grace
+    /// period. Peer posts after the observed board cursor do not reset quorum;
+    /// a newer owner instruction still rejects the gate atomically.
     pub async fn try_commit_consensus_at(
         &self,
         agent_ids: &[String],
@@ -898,14 +910,16 @@ impl Store {
                 return Ok(None);
             }
             let board_seq = latest_cursor(&transaction)?;
-            if expected_board_seq.is_some_and(|expected| expected != board_seq) {
+            if expected_board_seq
+                .is_some_and(|expected| expected < owner_seq || expected > board_seq)
+            {
                 return Ok(None);
             }
             let done = {
                 let mut statement = transaction.prepare_cached(
-                    "SELECT agent_id FROM votes WHERE done = 1 AND board_seq = ?1",
+                    "SELECT agent_id FROM votes WHERE done = 1 AND board_seq >= ?1",
                 )?;
-                let voters = statement.query_map([board_seq], |row| row.get::<_, String>(0))?;
+                let voters = statement.query_map([owner_seq], |row| row.get::<_, String>(0))?;
                 let mut done = 0;
                 for voter in voters {
                     if agent_ids.contains(&voter?) {
@@ -1749,7 +1763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unread_peer_update_prevents_stale_quorum_until_global_revalidation() -> Result<()> {
+    async fn peer_updates_preserve_quorum_and_owner_revision_grace() -> Result<()> {
         let store = Store::open(":memory:").await?;
         let ids = vec!["agent-001".to_owned(), "agent-002".to_owned()];
         let owner = store.append("owner", "objective", true).await?;
@@ -1762,26 +1776,27 @@ mod tests {
         let peer = store
             .append("agent-002", "review found more work", false)
             .await?;
-        // Peer messages are never classified by topic, but all newer messages
-        // must be delivered and considered before old evidence can close a run.
-        assert_eq!(store.try_commit_consensus(&ids, owner.seq, 2).await?, None);
-        store
-            .set_vote_at("agent-001", true, "reviewed newer board", peer.seq)
-            .await?;
-        assert_eq!(store.try_commit_consensus(&ids, owner.seq, 2).await?, None);
-        store
-            .set_vote_at("agent-002", true, "reviewed newer board", peer.seq)
-            .await?;
+        assert_eq!(store.latest_owner_seq().await?, owner.seq);
+        assert!(store
+            .votes()
+            .await?
+            .iter()
+            .all(|vote| vote.done && vote.board_seq == owner.seq));
+        // New votes still require full delivery, while existing evidence remains
+        // valid despite newer peer chatter during the consensus grace period.
+        assert!(store
+            .set_vote_at("agent-003", true, "unread peer post", owner.seq)
+            .await
+            .is_err());
         let (shutdown, shutdown_rx) = watch::channel(false);
         let mut revisions = store.subscribe_board();
-        // Fresh votes for a newer peer message cannot reuse grace earned at
-        // the old owner-only cursor, even when the owner revision is unchanged.
+        // A cursor older than the owner instruction cannot authorize a gate.
         assert_eq!(
             store
                 .try_commit_consensus_at_with_shutdown(
                     &ids,
                     owner.seq,
-                    owner.seq,
+                    owner.seq.saturating_sub(1),
                     2,
                     shutdown.clone(),
                 )
@@ -1790,9 +1805,10 @@ mod tests {
         );
         assert!(!*shutdown_rx.borrow());
         assert!(!revisions.has_changed()?);
+        assert_eq!(store.latest_seq().await?, peer.seq);
         assert_eq!(
             store
-                .try_commit_consensus_at_with_shutdown(&ids, owner.seq, peer.seq, 2, shutdown)
+                .try_commit_consensus_at_with_shutdown(&ids, owner.seq, owner.seq, 2, shutdown)
                 .await?,
             Some(2)
         );

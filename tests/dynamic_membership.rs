@@ -995,12 +995,12 @@ async fn interrupted_persistent_session_resumes_unfinished_prompt_roster_and_che
 
 async fn wait_for_votes(store: &Store, count: usize) -> Result<()> {
     loop {
-        let cursor = store.latest_seq().await?;
+        let owner_revision = store.latest_owner_seq().await?;
         if store
             .votes()
             .await?
             .iter()
-            .filter(|vote| vote.done && vote.board_seq == cursor)
+            .filter(|vote| vote.done && vote.board_seq >= owner_revision)
             .count()
             == count
         {
@@ -1105,7 +1105,7 @@ async fn changes_from_an_independent_store_handle_wake_and_reconcile_running_wor
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn waiting_voted_workers_wake_for_owner_peer_and_membership_work_without_waiting_for_other_requests(
+async fn waiting_voted_workers_ignore_peers_and_wake_for_owner_and_membership_work_without_waiting_for_other_requests(
 ) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         let directory = tempfile::tempdir()?;
@@ -1148,30 +1148,40 @@ async fn waiting_voted_workers_wake_for_owner_peer_and_membership_work_without_w
         }
         wait_for_votes(&store, 2).await?;
         // Two votes cannot reach the three-member threshold. The third real HTTP
-        // request stays blocked throughout both wakeups; no sleep/grace race is needed.
-        for (sender, text, owner) in [
-            ("owner", "new owner work wakes every voted worker", true),
-            (
+        // request stays blocked throughout owner/membership wakeups and peer
+        // parking checks, so consensus cannot mask an unexpected extra request.
+        let owner_text = "new owner work wakes every voted worker";
+        store.append("owner", owner_text, true).await?;
+        let mut owner_awakened = HashSet::new();
+        for _ in 0..2 {
+            let request = events.recv().await.context("waiting worker did not wake")?;
+            assert_ne!(request.id, "agent-003");
+            assert!(owner_awakened.insert(request.id));
+            assert!(
+                request.body["messages"].to_string().contains(owner_text),
+                "worker sees the exact owner instruction before dispatching"
+            );
+            request.release.send(()).unwrap();
+        }
+        wait_for_votes(&store, 2).await?;
+        assert!(!run.is_finished());
+        let parked_votes = store.votes().await?;
+        store
+            .append(
                 "agent-003",
                 "peer found remaining work while its provider request is pending",
                 false,
-            ),
-        ] {
-            store.append(sender, text, owner).await?;
-            let mut awakened = HashSet::new();
-            for _ in 0..2 {
-                let request = events.recv().await.context("waiting worker did not wake")?;
-                assert_ne!(request.id, "agent-003");
-                assert!(awakened.insert(request.id));
-                assert!(
-                    request.body["messages"].to_string().contains(text),
-                    "worker sees the exact unfiltered new instruction before dispatching"
-                );
-                request.release.send(()).unwrap();
-            }
-            wait_for_votes(&store, 2).await?;
-            assert!(!run.is_finished());
-        }
+            )
+            .await?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), events.recv())
+                .await
+                .is_err(),
+            "peer chatter must not dispatch another request for parked voters"
+        );
+        assert_eq!(store.votes().await?, parked_votes);
+        wait_for_votes(&store, 2).await?;
+        assert!(!run.is_finished());
         assert_eq!(control.add_agents(1).await?, vec!["agent-004"]);
         let mut awakened = HashSet::new();
         let mut joined = None;

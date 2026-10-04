@@ -63,6 +63,8 @@ pub struct Config {
     pub provider_headers: BTreeMap<String, String>,
     pub max_in_flight: usize,
     pub max_processes: usize,
+    pub explicit_max_in_flight: bool,
+    pub explicit_max_processes: bool,
     pub context_budget: usize,
     pub max_output_tokens: u32,
     pub grace_period: Duration,
@@ -71,6 +73,8 @@ pub struct Config {
     /// Interactive home stays available between completed work batches.
     pub interactive_session: bool,
     pub explicit_context_budget: bool,
+    /// Whether the output allowance was selected explicitly rather than from the model catalog.
+    pub explicit_max_output_tokens: bool,
     /// Explicit provider/MCP configuration retained for live menus and remembered launches.
     pub config_path: Option<PathBuf>,
     pub mcp: BTreeMap<String, crate::mcp::ServerConfig>,
@@ -96,14 +100,17 @@ impl Default for Config {
             provider_options: serde_json::json!({}),
             provider_headers: BTreeMap::new(),
             max_in_flight: 32,
-            max_processes: 4,
+            max_processes: 8,
+            explicit_max_in_flight: false,
+            explicit_max_processes: false,
             context_budget: 32_000,
-            max_output_tokens: 4_096,
+            max_output_tokens: 16_384,
             grace_period: Duration::from_secs(5),
             no_tui: false,
             resume: false,
             interactive_session: false,
             explicit_context_budget: false,
+            explicit_max_output_tokens: false,
             config_path: None,
             mcp: BTreeMap::new(),
         }
@@ -111,6 +118,34 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Scale implicit launch limits to the finalized swarm size while retaining
+    /// independently selected provider and subprocess limits.
+    pub fn resolve_concurrency(&mut self) {
+        if !self.explicit_max_in_flight {
+            self.max_in_flight = self.agents.max(32);
+        }
+        if !self.explicit_max_processes {
+            self.max_processes = self.agents.max(4);
+        }
+    }
+
+    /// Resolve after the context budget so small contexts retain room for input.
+    /// Implicit defaults are recalculated on every model selection; explicit
+    /// values are bounded by the selected model, and zero remains invalid.
+    pub fn use_model_output_limit(&mut self, model_output: Option<usize>) {
+        let model_output = model_output.filter(|limit| *limit > 0);
+        if !self.explicit_max_output_tokens {
+            self.max_output_tokens = model_output.unwrap_or(16_384).min(u32::MAX as usize) as u32;
+        } else if let Some(limit) = model_output {
+            self.max_output_tokens = self
+                .max_output_tokens
+                .min(limit.min(u32::MAX as usize) as u32);
+        }
+        if self.max_output_tokens as usize >= self.context_budget {
+            self.max_output_tokens = (self.context_budget / 4).min(u32::MAX as usize) as u32;
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(1..=500).contains(&self.agents) {
             bail!("agent count must be between 1 and 500");

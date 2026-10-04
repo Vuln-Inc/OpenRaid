@@ -34,8 +34,14 @@ pub struct LaunchProfile {
     pub context_budget: usize,
     pub explicit_context_budget: bool,
     pub max_output_tokens: u32,
+    #[serde(default)]
+    pub explicit_max_output_tokens: Option<bool>,
     pub max_in_flight: usize,
     pub max_processes: usize,
+    #[serde(default)]
+    pub explicit_max_in_flight: Option<bool>,
+    #[serde(default)]
+    pub explicit_max_processes: Option<bool>,
     pub grace_secs: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<PathBuf>,
@@ -55,8 +61,19 @@ impl LaunchProfile {
         config.context_budget = self.context_budget;
         config.explicit_context_budget = self.explicit_context_budget;
         config.max_output_tokens = self.max_output_tokens;
+        config.explicit_max_output_tokens = self
+            .explicit_max_output_tokens
+            .unwrap_or(self.max_output_tokens != 4096);
         config.max_in_flight = self.max_in_flight;
         config.max_processes = self.max_processes;
+        // Legacy profiles did not record intent. Their historical defaults
+        // become agent-scaled; custom limits continue to act as overrides.
+        config.explicit_max_in_flight = self
+            .explicit_max_in_flight
+            .unwrap_or(self.max_in_flight != 32);
+        config.explicit_max_processes = self
+            .explicit_max_processes
+            .unwrap_or(self.max_processes != 4);
         config.config_path = self.config_path.clone();
         config.grace_period = std::time::Duration::try_from_secs_f64(self.grace_secs)
             .unwrap_or(std::time::Duration::from_secs(5));
@@ -328,8 +345,11 @@ impl AuthStore {
             context_budget: config.context_budget,
             explicit_context_budget: config.explicit_context_budget,
             max_output_tokens: config.max_output_tokens,
+            explicit_max_output_tokens: Some(config.explicit_max_output_tokens),
             max_in_flight: config.max_in_flight,
             max_processes: config.max_processes,
+            explicit_max_in_flight: Some(config.explicit_max_in_flight),
+            explicit_max_processes: Some(config.explicit_max_processes),
             grace_secs: config.grace_period.as_secs_f64(),
             config_path: config.config_path.clone(),
         });

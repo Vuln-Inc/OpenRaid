@@ -64,7 +64,7 @@ impl ToolBus {
             ),
             definition(
                 "vote_done",
-                "Cast or withdraw your completion vote. A positive vote requires evidence and a fully current board. Voting never exits a worker: the harness alone enforces consensus and its grace period. Withdraw a vote when further work is needed.",
+                "Cast or withdraw your completion vote. A positive vote requires evidence and a fully current board. Once accepted, the worker parks until consensus or new owner instructions; ordinary peer messages preserve the vote. Voting never exits a worker: the harness alone enforces consensus and its grace period. Withdraw a vote when further work is needed.",
                 json!({
                     "done":{"type":"boolean"},
                     "evidence":{"type":"string", "description":"Verification evidence for completion, or reason for withdrawing."}
@@ -147,11 +147,13 @@ impl ToolBus {
                 } else {
                     self.store.set_vote(agent_id, false, evidence).await?;
                 }
-                Ok(json!({"accepted":true, "done":done, "worker_must_remain_active":true}))
+                Ok(
+                    json!({"accepted":true, "done":done, "worker_must_remain_active":true, "worker_must_park":done}),
+                )
             }
-            "apply_patch" | "run_command" | "pty_spawn" | "pty_write" | "pty_resize"
-            | "pty_kill" | "read_file" | "list_files" | "search_files" | "pty_read"
-            | "pty_list" => {
+            "write_file" | "apply_patch" | "run_command" | "pty_spawn" | "pty_write"
+            | "pty_resize" | "pty_kill" | "read_file" | "list_files" | "search_files"
+            | "pty_read" | "pty_list" => {
                 // Coordination is advisory during work: peer traffic must not
                 // prevent progress. Only positive votes require a current board.
                 match &self.metrics {

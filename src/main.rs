@@ -146,15 +146,18 @@ struct RunArgs {
     /// Open the interactive provider/model/thinking selection before running.
     #[arg(long)]
     select: bool,
-    #[arg(long, default_value_t = 32)]
-    max_in_flight: usize,
-    #[arg(long, default_value_t = 4)]
-    max_processes: usize,
-    /// Override the context budget. Codex uses its model limit; other providers default to 32000.
+    /// Override provider concurrency (defaults to max(32, agents)).
+    #[arg(long)]
+    max_in_flight: Option<usize>,
+    /// Override command concurrency (defaults to max(4, agents)).
+    #[arg(long)]
+    max_processes: Option<usize>,
+    /// Override the context budget (defaults to the model's advertised context window).
     #[arg(long)]
     context_budget: Option<usize>,
-    #[arg(long, default_value_t = 4_096)]
-    max_output_tokens: u32,
+    /// Override the output reserve (defaults to the model's supported output limit).
+    #[arg(long)]
+    max_output_tokens: Option<u32>,
     /// Stability grace after 75% completion consensus. Never an operation timeout.
     #[arg(long, default_value_t = 5.0)]
     grace_secs: f64,
@@ -217,6 +220,7 @@ impl RunArgs {
             .context("consensus grace is out of range")?;
         let interactive = !mock && (force_setup || self.select || requested_session.is_some());
         let explicit_context_budget = self.context_budget.is_some();
+        let explicit_max_output_tokens = self.max_output_tokens.is_some();
         let objective = match (self.objective, self.objective_file) {
             (Some(text), _) => text,
             (_, Some(path)) => tokio::fs::read_to_string(&path)
@@ -360,10 +364,18 @@ impl RunArgs {
             variant,
             provider_options,
             provider_headers,
-            max_in_flight: self.max_in_flight,
-            max_processes: self.max_processes,
+            max_in_flight: self
+                .max_in_flight
+                .unwrap_or_else(|| Config::default().max_in_flight),
+            max_processes: self
+                .max_processes
+                .unwrap_or_else(|| Config::default().max_processes),
+            explicit_max_in_flight: self.max_in_flight.is_some(),
+            explicit_max_processes: self.max_processes.is_some(),
             context_budget: self.context_budget.unwrap_or(32_000),
-            max_output_tokens: self.max_output_tokens,
+            max_output_tokens: self
+                .max_output_tokens
+                .unwrap_or_else(|| Config::default().max_output_tokens),
             grace_period,
             no_tui: self.no_tui
                 || !std::io::stdout().is_terminal()
@@ -374,6 +386,7 @@ impl RunArgs {
                 && std::io::stdin().is_terminal()
                 && std::io::stdout().is_terminal(),
             explicit_context_budget,
+            explicit_max_output_tokens,
             config_path,
             mcp,
             ..Config::default()
@@ -396,6 +409,18 @@ impl RunArgs {
                 if let Some(budget) = self.context_budget {
                     config.context_budget = budget;
                     config.explicit_context_budget = true;
+                }
+                if let Some(budget) = self.max_output_tokens {
+                    config.max_output_tokens = budget;
+                    config.explicit_max_output_tokens = true;
+                }
+                if let Some(limit) = self.max_in_flight {
+                    config.max_in_flight = limit;
+                    config.explicit_max_in_flight = true;
+                }
+                if let Some(limit) = self.max_processes {
+                    config.max_processes = limit;
+                    config.explicit_max_processes = true;
                 }
                 let info = catalog.provider(&config.provider);
                 let resolved_key = match api_key {
@@ -423,8 +448,12 @@ impl RunArgs {
                         }
                     }
                 }
-                let explicit_budget = config.explicit_context_budget;
-                use_codex_context_limit(&catalog, &mut config, explicit_budget);
+                use_model_context_limit(&catalog, &mut config);
+                let output_limit = catalog
+                    .model(&config.provider, &config.model)
+                    .map(|model| model.limit.output);
+                config.use_model_output_limit(output_limit);
+                adjust_thinking_budget(&mut config, output_limit.unwrap_or(0))?;
             } else {
                 if is_codex_provider(&config.provider) {
                     refresh_codex_models(&mut catalog, &config, &auth).await?;
@@ -432,14 +461,7 @@ impl RunArgs {
                 configure_provider(&catalog, &mut config, self.protocol.as_deref())?;
             }
         } else if interactive {
-            if !wizard(
-                catalog,
-                &mut config,
-                self.protocol.as_deref(),
-                explicit_context_budget,
-            )
-            .await?
-            {
+            if !wizard(catalog, &mut config, self.protocol.as_deref()).await? {
                 return Ok(None);
             }
         } else if !mock {
@@ -463,9 +485,9 @@ impl RunArgs {
                     bail!("model {} is not advertised by your Codex LB server; run openraid models codex-lb --base-url {}", config.model, public_endpoint(&config.base_url));
                 }
             }
-            use_codex_context_limit(&catalog, &mut config, explicit_context_budget);
             configure_provider(&catalog, &mut config, self.protocol.as_deref())?;
         }
+        config.resolve_concurrency();
         config.validate()?;
         enable_remembered_recovery(
             &mut config,
@@ -967,6 +989,8 @@ fn configure_provider_with_auth(
     let explicit_endpoint = config.base_url.clone();
     let provider = catalog.provider(&config.provider);
     let model = catalog.model(&config.provider, &config.model);
+    use_model_context_limit(catalog, config);
+    config.use_model_output_limit(model.map(|model| model.limit.output));
     let mut factory_settings = auth.provider_metadata(&config.provider)?;
     let mut headers = provider.map(|p| p.loader_headers()).unwrap_or_default();
     if let Some(provider) = provider {
@@ -981,18 +1005,6 @@ fn configure_provider_with_auth(
     }
     let mut options = json!({});
     if let Some(model) = model {
-        if model.limit.context > 0 {
-            config.context_budget = config.context_budget.min(model.limit.context);
-        }
-        if model.limit.output > 0 {
-            config.max_output_tokens = config
-                .max_output_tokens
-                .min(model.limit.output.min(u32::MAX as usize) as u32);
-        }
-        if config.max_output_tokens as usize >= config.context_budget {
-            config.max_output_tokens =
-                (config.context_budget / 4).max(1).min(u32::MAX as usize) as u32;
-        }
         config.api_model = Some(model.api_id.clone());
         config.provider_npm.clone_from(&model.npm);
         if config.base_url.is_empty() {
@@ -1262,6 +1274,10 @@ fn redact_json(mut value: Value) -> Value {
 }
 
 fn adjust_thinking_budget(config: &mut Config, model_output: usize) -> Result<()> {
+    // Preserve invalid explicit zero for the normal configuration validation.
+    if config.max_output_tokens == 0 {
+        return Ok(());
+    }
     let budget = config
         .provider_options
         .pointer("/thinking/budgetTokens")
@@ -1270,9 +1286,17 @@ fn adjust_thinking_budget(config: &mut Config, model_output: usize) -> Result<()
                 .provider_options
                 .pointer("/reasoningConfig/budgetTokens")
         })
+        .or_else(|| {
+            config
+                .provider_options
+                .pointer("/thinkingConfig/thinkingBudget")
+        })
         .and_then(Value::as_u64)
         .unwrap_or(0);
     if budget >= u64::from(config.max_output_tokens) {
+        if config.explicit_max_output_tokens && budget > 0 {
+            bail!("thinking budget {budget} must be below explicit --max-output-tokens {}; raise the output limit or lower the thinking budget", config.max_output_tokens);
+        }
         let required = budget.saturating_add(1024);
         if required >= config.context_budget as u64
             || (model_output > 0 && required > model_output as u64)
@@ -1297,15 +1321,17 @@ fn merge_json(target: &mut Value, source: &Value) {
     }
 }
 
-fn use_codex_context_limit(catalog: &Catalog, config: &mut Config, explicit_budget: bool) {
-    if explicit_budget || !is_codex_provider(&config.provider) {
-        return;
-    }
-    if let Some(model) = catalog
+fn use_model_context_limit(catalog: &Catalog, config: &mut Config) {
+    let limit = catalog
         .model(&config.provider, &config.model)
         .filter(|model| model.limit.context > 0)
-    {
-        config.context_budget = model.limit.context;
+        .map(|model| model.limit.context);
+    if config.explicit_context_budget {
+        if let Some(limit) = limit {
+            config.context_budget = config.context_budget.min(limit);
+        }
+    } else {
+        config.context_budget = limit.unwrap_or_else(|| Config::default().context_budget);
     }
 }
 
@@ -1371,7 +1397,6 @@ async fn wizard(
     mut catalog: Catalog,
     config: &mut Config,
     protocol_override: Option<&str>,
-    explicit_context_budget: bool,
 ) -> Result<bool> {
     let mut auth = AuthStore::load_default()?;
     let mut ui = SetupUi::new()?;
@@ -1573,7 +1598,7 @@ async fn wizard(
                 config.provider_headers = original_headers.clone();
                 config.max_output_tokens = original_output_budget;
                 config.context_budget = original_context_budget;
-                use_codex_context_limit(&catalog, config, explicit_context_budget);
+                config.resolve_concurrency();
                 if let Err(error) = configure_provider(&catalog, config, protocol_override) {
                     let choices = [Choice::new("edit", "Review provider settings", format!("{error:#}")), Choice::new("cancel", "Cancel setup", "Return to your terminal")];
                     if ui.pick("Connection needs attention", "Correct the provider, model, thinking variant or endpoint before launch.", &choices, Some("edit"))?.as_deref() == Some("edit") { step = 0; continue; }
@@ -1660,11 +1685,6 @@ fn resolve_live_selection(
     next.oauth = None;
     next.provider_options = json!({});
     next.provider_headers.clear();
-    if !next.explicit_context_budget {
-        next.context_budget = Config::default().context_budget;
-    }
-    let explicit_budget = next.explicit_context_budget;
-    use_codex_context_limit(catalog, &mut next, explicit_budget);
     let protocol_override = catalog
         .model(provider, model)
         .and_then(|model| model.metadata["_openraid_protocol"].as_str());
@@ -1732,6 +1752,12 @@ async fn run(config: Config) -> Result<Option<(openraid::session::SessionNavigat
         (navigation, active)
     }))
 }
+
+#[cfg(test)]
+mod output_budget_tests;
+
+#[cfg(test)]
+mod concurrency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2160,7 +2186,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_context_defaults_to_configured_model_limit_and_respects_explicit_budgets() {
+    fn model_context_defaults_to_configured_limits_and_respects_explicit_budgets() {
         let mut catalog = Catalog::from_json("{}").unwrap();
         catalog
             .apply_config(&json!({"provider":{"codex-pool":{
@@ -2172,14 +2198,145 @@ mod tests {
             model: "gpt-6.1-sol".into(),
             ..Config::default()
         };
-        use_codex_context_limit(&catalog, &mut config, false);
+        use_model_context_limit(&catalog, &mut config);
         assert_eq!(config.context_budget, 372000);
         config.context_budget = 32000;
-        use_codex_context_limit(&catalog, &mut config, true);
+        config.explicit_context_budget = true;
+        use_model_context_limit(&catalog, &mut config);
         assert_eq!(config.context_budget, 32000);
+        config.context_budget = 500000;
+        use_model_context_limit(&catalog, &mut config);
+        assert_eq!(config.context_budget, 372000);
         config.provider = "openai".into();
-        use_codex_context_limit(&catalog, &mut config, false);
+        config.explicit_context_budget = false;
+        use_model_context_limit(&catalog, &mut config);
         assert_eq!(config.context_budget, 32000);
+    }
+
+    #[test]
+    fn bundled_provider_context_defaults_use_advertised_capacity() {
+        let catalog = Catalog::bundled().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let auth = empty_auth(temp.path());
+        for provider in ["openai", "google", "anthropic"] {
+            let model = catalog
+                .provider(provider)
+                .unwrap()
+                .models
+                .values()
+                .find(|model| model.limit.context > 100000 && model.tool_call)
+                .unwrap();
+            let mut config = Config {
+                provider: provider.into(),
+                model: model.id.clone(),
+                api_key: Some("fixture-key".into()),
+                base_url: String::new(),
+                ..Config::default()
+            };
+            configure_provider_with_auth(&catalog, &mut config, None, &auth).unwrap();
+            assert_eq!(config.context_budget, model.limit.context, "{provider}");
+            config.context_budget = 32000;
+            config.explicit_context_budget = true;
+            configure_provider_with_auth(&catalog, &mut config, None, &auth).unwrap();
+            assert_eq!(config.context_budget, 32000, "{provider}");
+        }
+    }
+
+    #[test]
+    fn live_model_context_defaults_recalculate_upward_downward_and_without_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth = empty_auth(temp.path());
+        let mut catalog = Catalog::from_json("{}").unwrap();
+        catalog
+            .apply_config(&json!({"provider":{"fixture":{
+                "options":{"baseURL":"http://localhost/v1","apiKey":"fixture-key"},
+                "models":{
+                    "small":{"tool_call":true,"limit":{"context":64000,"output":4096}},
+                    "large":{"tool_call":true,"limit":{"context":1000000,"output":65536}},
+                    "unknown":{"tool_call":true,"limit":{"context":0,"output":0}}
+                }
+            }}}))
+            .unwrap();
+        let mut config = Config {
+            objective: "verify context selection".into(),
+            provider: "fixture".into(),
+            model: "small".into(),
+            base_url: String::new(),
+            ..Config::default()
+        };
+        configure_provider_with_auth(&catalog, &mut config, None, &auth).unwrap();
+        assert_eq!(config.context_budget, 64000);
+        for (model, budget) in [("large", 1000000), ("small", 64000), ("unknown", 32000)] {
+            config =
+                resolve_live_selection(&catalog, &config, "fixture", model, None, &auth).unwrap();
+            assert_eq!(config.context_budget, budget, "{model}");
+        }
+        config.context_budget = 24000;
+        config.explicit_context_budget = true;
+        config =
+            resolve_live_selection(&catalog, &config, "fixture", "large", None, &auth).unwrap();
+        assert_eq!(config.context_budget, 24000);
+    }
+
+    #[tokio::test]
+    async fn remembered_context_defaults_follow_catalog_and_cli_overrides_take_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(temp.path()).unwrap();
+        let config_path = workspace.join("models.json");
+        std::fs::write(
+            &config_path,
+            json!({"provider":{"fixture":{
+                "options":{"baseURL":"http://localhost/v1","apiKey":"fixture-key"},
+                "models":{"large":{"tool_call":true,"limit":{"context":1000000,"output":64000}}}
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        for (explicit, override_budget, expected) in [
+            (false, None, 1000000),
+            (true, None, 48000),
+            (false, Some("24000"), 24000),
+            (true, Some("24000"), 24000),
+        ] {
+            let mut auth = empty_auth(temp.path());
+            auth.set_selection("fixture", "large", None);
+            auth.remember_launch(&Config {
+                workspace: workspace.clone(),
+                database: workspace.join("remembered.sqlite3"),
+                objective: "verify remembered context".into(),
+                provider: "fixture".into(),
+                model: "large".into(),
+                base_url: "http://localhost/v1".into(),
+                config_path: Some(config_path.clone()),
+                context_budget: 48000,
+                explicit_context_budget: explicit,
+                ..Config::default()
+            });
+            let mut arguments = vec![
+                "openraid",
+                "setup",
+                "verify remembered context",
+                "--no-tui",
+                "--workspace",
+                workspace.to_str().unwrap(),
+            ];
+            if let Some(budget) = override_budget {
+                arguments.extend(["--context-budget", budget]);
+            }
+            let Some(Command::Setup(args)) = Cli::parse_from(arguments).command else {
+                panic!("setup arguments")
+            };
+            let config = args
+                .config_with_auth(false, true, auth)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(config.context_budget, expected);
+            assert_eq!(
+                config.explicit_context_budget,
+                explicit || override_budget.is_some()
+            );
+        }
     }
 
     #[test]

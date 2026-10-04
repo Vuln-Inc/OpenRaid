@@ -84,7 +84,16 @@ pub struct Harness {
 }
 
 impl Harness {
-    pub async fn new(config: Config) -> Result<Self> {
+    pub async fn new(mut config: Config) -> Result<Self> {
+        // Library callers can set numeric limits directly without the CLI's
+        // explicit flags. Scale only untouched defaults, preserving custom caps.
+        let defaults = Config::default();
+        if !config.explicit_max_in_flight && config.max_in_flight == defaults.max_in_flight {
+            config.max_in_flight = config.agents.max(32);
+        }
+        if !config.explicit_max_processes && config.max_processes == defaults.max_processes {
+            config.max_processes = config.agents.max(4);
+        }
         config.validate()?;
         let system = swarm_system_prompt(
             &config.objective,
@@ -378,8 +387,7 @@ impl Harness {
         let mut consensus = Consensus::new(ordered_ids.len(), self.config.grace_period);
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut owner_revision = 0;
-        let mut supervisor_cursor = 0;
+        let mut owner_revision;
         let mut finished = 0;
         let final_votes;
         let completed;
@@ -451,29 +459,20 @@ impl Harness {
                 }
             }
             self.store.refresh_board().await?;
-            loop {
-                let page = self.store.read_board(supervisor_cursor, BOARD_PAGE).await?;
-                if page.is_empty() {
-                    break;
-                }
-                for message in page {
-                    supervisor_cursor = message.seq;
-                    if message.owner {
-                        owner_revision = message.seq;
-                    }
-                }
-            }
+            // Owner freshness is indexed durable metadata. Reading peer history
+            // until empty would let continuous chatter starve consensus checks.
+            owner_revision = self.store.latest_owner_seq().await?;
             let votes = self.store.votes().await?;
             let global_seq = self.store.latest_seq().await?;
             let done = votes
                 .iter()
-                .filter(|v| v.done && v.board_seq == global_seq && ids.contains(&v.agent_id))
+                .filter(|v| v.done && v.board_seq >= owner_revision && ids.contains(&v.agent_id))
                 .count();
             if self.control.is_paused() {
-                consensus.update(0, global_seq, Instant::now());
+                consensus.update(0, owner_revision, Instant::now());
                 continue;
             }
-            if consensus.update(done, global_seq, Instant::now()) {
+            if consensus.update(done, owner_revision, Instant::now()) {
                 let Some(confirmed_done) = self
                     .store
                     .try_commit_consensus_at_with_shutdown(
@@ -734,6 +733,17 @@ async fn mock_worker(id: &str, shared: &WorkerShared, shutdown: &mut WorkerStop)
         if !wait_while_paused(id, shared, shutdown).await? {
             break;
         }
+        if shared.store.vote(id).await?.is_some_and(|vote| vote.done) {
+            shared.metrics.set_status(id, AgentStatus::Voted);
+            tokio::select! {
+                changed = shutdown.changed() => { changed?; },
+                _ = wait_for_pause(&shared.control) => {},
+                changed = board_revision.changed() => {
+                    changed.context("board notifier disconnected")?;
+                }
+            }
+            continue;
+        }
         read_mock_board(id, shared, &mut cursor, &mut seen).await?;
         if shutdown.requested() {
             break;
@@ -741,12 +751,7 @@ async fn mock_worker(id: &str, shared: &WorkerShared, shutdown: &mut WorkerStop)
         let members = shared.control.members();
         if members.iter().all(|member| seen.contains(member)) {
             let evidence = format!("offline smoke verified all {} peer messages from the active roster by ordered global cursor", members.len());
-            if !shared
-                .store
-                .vote(id)
-                .await?
-                .is_some_and(|vote| vote.done && vote.board_seq >= cursor)
-            {
+            if !shared.store.vote(id).await?.is_some_and(|vote| vote.done) {
                 match shared
                     .tools
                     .execute(id, "vote_done", &json!({"done":true,"evidence":evidence}))
@@ -850,6 +855,17 @@ async fn live_worker(
         if !wait_while_paused(id, shared, shutdown).await? {
             break;
         }
+        // Park before draining or compacting peer traffic. Owner transactions
+        // clear votes atomically, so only new steering can resume voted work.
+        if shared.store.vote(id).await?.is_some_and(|vote| vote.done) {
+            shared.metrics.set_status(id, AgentStatus::Voted);
+            tokio::select! {
+                changed = shutdown.changed() => { changed.context("supervisor disconnected")?; },
+                _ = wait_for_pause(&shared.control) => {},
+                changed = board_revision.changed() => { changed.context("board notifier disconnected")?; },
+            }
+            continue;
+        }
         let active = shared.control.current();
         context.select_model(active.revision, context_config(&active.config));
         if shutdown.requested() {
@@ -863,25 +879,8 @@ async fn live_worker(
         if shutdown.requested() {
             break;
         }
-        if let Some(vote) = shared.store.vote(id).await?.filter(|v| v.done) {
-            if cursor > vote.board_seq {
-                shared
-                    .store
-                    .set_vote(
-                        id,
-                        false,
-                        "new global board entries require reconsidering completion evidence",
-                    )
-                    .await?;
-                context.push(json!({"role":"user","content":"new global board messages arrived after your completion evidence. your done vote was withdrawn. reconsider every new message, coordinate any remaining work and vote again only with current verification."}));
-            } else {
-                shared.metrics.set_status(id, AgentStatus::Voted);
-                tokio::select! {
-                    changed = shutdown.changed() => { changed.context("supervisor disconnected")?; },
-                    changed = board_revision.changed() => { changed.context("board notifier disconnected")?; },
-                }
-                continue;
-            }
+        if shared.store.vote(id).await?.is_some_and(|vote| vote.done) {
+            continue;
         }
         if shutdown.requested() {
             break;
@@ -1190,7 +1189,11 @@ fn context_config(config: &Config) -> ContextConfig {
     ContextConfig {
         max_tokens: config.context_budget,
         reserve_output_tokens: config.max_output_tokens as usize,
-        summary_max_tokens: (available / 8).clamp(64, 2048),
+        // Summaries scale with usable input history, while staying within the
+        // output allowance actually sent to the provider for compaction.
+        summary_max_tokens: (available / 8)
+            .max(64)
+            .min(config.max_output_tokens as usize),
         retain_recent_tokens: available / 4,
     }
 }
@@ -1304,6 +1307,10 @@ fn record_event(id: &str, metrics: &Metrics, event: ProviderEvent) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "summary_budget_tests.rs"]
+mod summary_budget_tests;
 
 #[cfg(test)]
 mod tests {

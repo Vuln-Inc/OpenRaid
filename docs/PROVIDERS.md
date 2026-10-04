@@ -22,6 +22,22 @@ An imported provider named `codex-pool` uses its configured endpoint automatical
 
 Guided launches keep an interactive session open after a batch reaches consensus. The saved launch profile remembers its workspace, database, swarm size, model settings, and explicit configuration path. A later `setup` opens saved history at an idle home screen, including interrupted unfinished tasks. Reopening or switching to a session does not start agents. Use `/start your objective` to begin work or `/new` to create fresh history; `setup --resume` explicitly continues an interrupted task with its durable roster and checkpoints. Completed historical objectives are not replayed. `run --select` starts the selection flow again; noninteractive runs exit after their work drains.
 
+## Model budgets
+
+When `--context-budget` and `--max-output-tokens` are omitted, every provider uses
+the selected model's positive advertised context and output limits. Unknown
+limits fall back to 32,000 context tokens and 16,384 output tokens. Explicit
+overrides are remembered separately from implicit defaults and remain bounded
+by the selected model's supported limits. Switching models or reopening a saved
+session recalculates implicit allowances.
+
+Output tokens may include thinking and generated text. Incompatible explicit
+thinking/output budgets are rejected rather than silently increasing an explicit
+output limit. If output would consume the entire context, the output reserve is
+reduced to one quarter of context so normal input remains usable. Compaction
+starts around 75% of available input capacity; summaries scale with that capacity
+and remain bounded by the supported output allowance.
+
 ## Live session controls
 
 Press `/` for the searchable command menu, or use these controls while the dashboard is open:
@@ -298,7 +314,7 @@ Use the **Responses** protocol for Codex models. codex-lb's tagged client guide 
 
 Model availability depends on the account pool and upstream rollout. OpenRaid obtains Codex LB models from the configured server's live `/models` API rather than a hardcoded model list. Model IDs, advertised thinking levels, and token limits come from that response; unavailable metadata is not inferred from unrelated OpenAI models.
 
-Explicit per-model configuration, such as `provider.codex-pool.models.MODEL.limit.context` and `.limit.output`, overrides discovered limits. These settings survive a refresh, but models absent from the API response are not added to the picker. For `codex-lb` and `codex-pool`, the effective model context limit becomes the default run context budget. An explicit `--context-budget` keeps a smaller budget; output reservation remains controlled by `--max-output-tokens` and capped at the model's output limit.
+Explicit per-model configuration, such as `provider.codex-pool.models.MODEL.limit.context` and `.limit.output`, overrides discovered limits. These settings survive a refresh, but models absent from the API response are not added to the picker. As with other providers, effective model context and output limits become the implicit run budgets; explicit `--context-budget` and `--max-output-tokens` overrides remain bounded by supported limits.
 
 To inspect the models currently served by your deployment:
 
