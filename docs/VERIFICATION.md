@@ -1,5 +1,29 @@
 # Verification record
 
+## v1.1.2 — Continuous board history navigation
+
+Issue [#19](https://github.com/Vuln-Inc/openraid/issues/19) is covered by six
+rendered/input regressions in `src/terminal/board_navigation_tests.rs`. Arrow keys,
+vi keys, and the shared mouse-wheel path load adjacent bounded pages at wrapped
+scroll boundaries. Tests verify every message in a 250-message board in both
+directions, PageUp/PageDown and follow controls, wrapped-message tail preservation,
+empty history, and new messages discovered without a refresh tick.
+
+Windows acceptance passed on **2026-10-04** with version **1.1.2**:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --locked --all-targets -- --include-ignored` | **322 passed, 0 failed, 0 ignored**: 193 library, 19 CLI-configuration, 110 integration |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `npm test --prefix scripts` | **25 passed, 0 failed, 0 skipped** |
+| `git diff --check` | Passed |
+
+The release tag triggers the existing Linux x86-64, Windows x86-64, macOS Intel,
+and macOS Apple Silicon verification/build workflow. It publishes archives and
+`SHA256SUMS` only after all platform jobs pass, including optimized help and a
+500-worker offline swarm smoke.
+
 ## v1.1.1 — Session reopening, storage, roster, and inspection
 
 This patch release combines the issue #15 fix and the #16–#18 fixes documented

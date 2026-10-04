@@ -7,10 +7,10 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.1.1-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.1)
+[![Version](https://img.shields.io/badge/version-1.1.2-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.2)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
-[![Verification](https://img.shields.io/badge/verified-316%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
+[![Verification](https://img.shields.io/badge/verified-322%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
 [**Quick start**](#install-and-launch) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
@@ -140,12 +140,12 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.1.1 archive |
+| Platform | v1.1.2 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.1.1-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.1.1-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.1.1-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.1.1-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.1.2-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.1.2-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.1.2-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.1.2-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
 
@@ -411,6 +411,8 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `q` | Close/detach when outside text entry and overlays |
 
 The `Ctrl+X` leader waits for its next key without a timer. Mouse clicks focus panels; clicking a sent prompt opens copy, jump, and restore actions.
+
+Board arrow keys, `j` / `k`, and the mouse wheel automatically load adjacent 100-message pages at scroll boundaries. History remains paused while browsing; `End` or `f` returns to live following.
 
 Drag text within a panel or agent card to select it; releasing the mouse copies it immediately without `Ctrl+C`. Clipboard access depends on your OS or terminal support. The displayed TPS is an elapsed-weighted rolling one-minute average; during warm-up it uses the observed duration rather than a full minute.
 

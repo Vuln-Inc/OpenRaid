@@ -1,6 +1,6 @@
 [package]
 name = "openraid"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 description = "Single-process native Tokio multi-agent swarm harness"
 authors = ["ardadl <153114611+ardadl@users.noreply.github.com>"]

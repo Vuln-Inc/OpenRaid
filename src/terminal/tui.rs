@@ -1,5 +1,8 @@
 //! A live operator console. Board navigation is exclusively global cursor pagination.
 #[cfg(test)]
+#[path = "board_navigation_tests.rs"]
+mod board_navigation_tests;
+#[cfg(test)]
 #[path = "inspection_selection_tests.rs"]
 mod inspection_selection_tests;
 #[cfg(test)]
@@ -588,6 +591,7 @@ impl UiState {
                         (self.selected + self.grid_page_size).min(agent_count.saturating_sub(1));
                     return Ok(false);
                 }
+                self.latest = store.latest_seq().await?;
                 let next = self.board.last().map(|m| m.seq).unwrap_or(self.after);
                 if next < self.latest {
                     self.follow = false;
@@ -596,6 +600,7 @@ impl UiState {
                     self.load(store).await?;
                 } else {
                     self.follow = true;
+                    self.load(store).await?;
                 }
             }
             KeyCode::Home if self.focus == Focus::Board => {
@@ -621,8 +626,12 @@ impl UiState {
                 self.detail_scroll = 0;
             }
             KeyCode::End if self.focus == Focus::Detail => self.detail_follow = true,
-            KeyCode::Down | KeyCode::Char('j') => self.navigate(1, agent_count),
-            KeyCode::Up | KeyCode::Char('k') => self.navigate(-1, agent_count),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.navigate_with_store(1, agent_count, store).await?
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.navigate_with_store(-1, agent_count, store).await?
+            }
             KeyCode::Enter => {
                 if self.grid || self.focus != Focus::Board {
                     self.open_inspection(agent_count);
@@ -637,6 +646,57 @@ impl UiState {
             self.palette_editing = false;
         }
         Ok(false)
+    }
+
+    async fn navigate_with_store(
+        &mut self,
+        delta: i32,
+        agents: usize,
+        store: &Store,
+    ) -> Result<()> {
+        if self.inspecting || self.focus != Focus::Board {
+            self.navigate(delta, agents);
+            return Ok(());
+        }
+
+        let last_scroll = self.board_last_scroll();
+        self.follow = false;
+        if delta > 0 && self.board_scroll >= last_scroll {
+            // History can gain new messages while live following is paused.
+            self.latest = store.latest_seq().await?;
+            let next = self
+                .board
+                .last()
+                .map(|message| message.seq)
+                .unwrap_or(self.after);
+            if next < self.latest {
+                self.after = next;
+                self.board_scroll = 0;
+                self.load(store).await?;
+            }
+        } else if delta < 0 && self.board_scroll == 0 && self.after > 0 {
+            self.after = self.after.saturating_sub(PAGE_SIZE as u64);
+            self.load(store).await?;
+            self.board_scroll = self.board_last_scroll();
+        } else {
+            self.navigate(delta, agents);
+            self.board_scroll = self.board_scroll.min(last_scroll);
+        }
+        Ok(())
+    }
+
+    fn board_last_scroll(&self) -> u16 {
+        let area = self.panels[0];
+        let lines = self
+            .board
+            .iter()
+            .flat_map(board_message_lines)
+            .collect::<Vec<_>>();
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .line_count(area.width.saturating_sub(2).max(1))
+            .saturating_sub(usize::from(area.height.saturating_sub(2)))
+            .min(usize::from(u16::MAX)) as u16
     }
 
     fn navigate(&mut self, delta: i32, agents: usize) {
@@ -1434,8 +1494,8 @@ async fn run_console(
                         }
                     }
                     match mouse.kind {
-                        MouseEventKind::ScrollDown => app.navigate(1, agent_count),
-                        MouseEventKind::ScrollUp => app.navigate(-1, agent_count),
+                        MouseEventKind::ScrollDown => app.navigate_with_store(1, agent_count, &store).await?,
+                        MouseEventKind::ScrollUp => app.navigate_with_store(-1, agent_count, &store).await?,
                         _ => {},
                     }
                 },
@@ -1978,7 +2038,30 @@ fn draw_grid(
     }
 }
 
+fn board_message_lines(message: &BoardMessage) -> Vec<Line<'static>> {
+    let palette = crate::theme::current_theme().palette;
+    let role = if message.owner {
+        "owner"
+    } else {
+        message.sender.as_str()
+    };
+    let mut lines = vec![Line::styled(
+        format!("#{}  [{}]", message.seq, role),
+        Style::default()
+            .fg(if message.owner {
+                palette.warning
+            } else {
+                palette.accent
+            })
+            .add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(message.body.lines().map(|line| Line::raw(line.to_owned())));
+    lines.push(Line::raw(""));
+    lines
+}
+
 fn draw_board(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
+    app.panels[0] = area;
     let palette = crate::theme::current_theme().palette;
     let first = app.board.first().map(|m| m.seq).unwrap_or(0);
     let last = app.board.last().map(|m| m.seq).unwrap_or(0);
@@ -1992,25 +2075,7 @@ fn draw_board(frame: &mut Frame<'_>, area: Rect, app: &mut UiState) {
     let mut wrapped_rows = 0usize;
     for message in &app.board {
         let first_line = lines.len();
-        let role = if message.owner {
-            "owner"
-        } else {
-            message.sender.as_str()
-        };
-        lines.push(Line::styled(
-            format!("#{}  [{}]", message.seq, role),
-            Style::default()
-                .fg(if message.owner {
-                    palette.warning
-                } else {
-                    palette.accent
-                })
-                .add_modifier(Modifier::BOLD),
-        ));
-        for line in message.body.lines() {
-            lines.push(Line::raw(line.to_owned()));
-        }
-        lines.push(Line::raw(""));
+        lines.extend(board_message_lines(message));
         let height = Paragraph::new(lines[first_line..].to_vec())
             .wrap(Wrap { trim: false })
             .line_count(area.width.saturating_sub(2).max(1));
