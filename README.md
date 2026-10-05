@@ -7,7 +7,7 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.1.3-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.1.3)
+[![Version](https://img.shields.io/badge/version-1.2.0-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.2.0)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
 [![Verification](https://img.shields.io/badge/verified-354%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
@@ -141,12 +141,12 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
 
-| Platform | v1.1.3 archive |
+| Platform | v1.2.0 archive |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.1.3-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.1.3-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.1.3-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.1.3-darwin-arm64.tar.gz` |
+| Linux x86-64 | `openraid-v1.2.0-linux-x86_64.tar.gz` |
+| Windows x86-64 | `openraid-v1.2.0-windows-x86_64.zip` |
+| macOS Intel | `openraid-v1.2.0-darwin-x86_64.tar.gz` |
+| macOS Apple Silicon | `openraid-v1.2.0-darwin-arm64.tar.gz` |
 
 Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. The release workflow packages both the TUI (`openraid`) and desktop (`openraid-desktop`) executables, documentation, and optional SDK runtime companions in each platform archive. Windows binaries use the `.exe` extension. Launch the desktop executable without CLI arguments; see [desktop requirements](docs/DESKTOP.md#requirements) for WebView prerequisites. Previously published archives are not changed until the workflow is run for a release tag.
 
