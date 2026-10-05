@@ -113,12 +113,7 @@ fn desktop_security_does_not_load_a_remote_webview_or_shell_plugin() {
 #[test]
 fn local_desktop_artifacts_are_excluded_from_public_source() {
     let root_ignore = fs::read_to_string(root().join(".gitignore")).unwrap();
-    for pattern in [
-        ".env.*",
-        ".openraid/",
-        "/.playwright-mcp/",
-        "/gui_starter_messageboard.txt",
-    ] {
+    for pattern in [".env.*", ".openraid/", "/.playwright-mcp/"] {
         assert!(root_ignore.lines().any(|line| line == pattern));
     }
     let desktop_ignore = fs::read_to_string(root().join("desktop/.gitignore")).unwrap();

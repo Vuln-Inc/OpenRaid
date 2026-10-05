@@ -1,5 +1,32 @@
 # Verification record
 
+## v1.2.0 — Optional desktop and combined releases
+
+Windows release preparation passed on **2026-10-05**, using Rust **1.90.0**:
+
+| Check | Result |
+| --- | --- |
+| `python scripts/package-release.py --verify-tag v1.2.0` | TUI, desktop host, Tauri configuration and frontend versions match |
+| `cargo +1.90.0 test --locked -j 2 --all-targets -- --include-ignored` | **380 passed, 0 failed, 0 ignored** |
+| `cargo +1.90.0 test --manifest-path desktop/src-tauri/Cargo.toml --locked -j 2 --all-targets` | **6 passed, 0 failed** |
+| `npm test --prefix desktop` | **80 passed, 0 failed** |
+| `npm run build --prefix desktop` | TypeScript checks and production frontend build passed |
+| `npm test --prefix scripts` | **25 passed, 0 failed** |
+| `python scripts/test-package-release.py` | **7 passed**, including all four archive layouts, executable permissions and checksums |
+| Root and desktop warnings-denied all-target Clippy | Passed |
+| Root and desktop Rust formatting | Passed |
+| `actionlint -shellcheck= .github/workflows/release.yml` | Passed; shellcheck not run |
+
+The cleanup regression was updated to match the current ignore rules rather
+than require an obsolete local messageboard filename. Historical release
+records below remain unchanged.
+
+These are local test/build results, not release publication or four-platform
+native acceptance. The release workflow must still build both optimized
+executables on Linux x86-64, Windows x86-64, macOS Intel and macOS Apple Silicon
+before publishing the combined archives and `SHA256SUMS`. Linux/macOS desktop
+launches and signed installers are not verified by these Windows checks.
+
 ## v1.1.3 — Model capacity, swarm parallelism, and persistent completion
 
 Issues [#20](https://github.com/Vuln-Inc/openraid/issues/20)–
