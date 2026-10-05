@@ -19,15 +19,19 @@ jobs:
           - os: ubuntu-24.04
             platform: linux-x86_64
             binary: target/release/openraid
+            desktop_binary: desktop/src-tauri/target/release/openraid-desktop
           - os: windows-2022
             platform: windows-x86_64
             binary: target/release/openraid.exe
+            desktop_binary: desktop/src-tauri/target/release/openraid-desktop.exe
           - os: macos-15-intel
             platform: darwin-x86_64
             binary: target/release/openraid
+            desktop_binary: desktop/src-tauri/target/release/openraid-desktop
           - os: macos-15
             platform: darwin-arm64
             binary: target/release/openraid
+            desktop_binary: desktop/src-tauri/target/release/openraid-desktop
     defaults:
       run:
         shell: bash
@@ -37,7 +41,9 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-          cache-dependency-path: scripts/package-lock.json
+          cache-dependency-path: |
+            scripts/package-lock.json
+            desktop/package-lock.json
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -46,8 +52,19 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
       - name: Verify version matches release tag
+        run: python scripts/package-release.py --verify-tag "$GITHUB_REF_NAME"
+      # Check the default graph before installing any desktop/WebView prerequisites.
+      - name: Verify default TUI dependency isolation
+        shell: python
         run: |
-          python -c 'import json,os,subprocess; p=json.loads(subprocess.check_output(["cargo","metadata","--locked","--no-deps","--format-version","1"])); v=next(x["version"] for x in p["packages"] if x["name"]=="openraid"); assert os.environ["GITHUB_REF_NAME"]=="v"+v, "Run this workflow from the matching vVERSION tag"'
+          import json
+          import subprocess
+          metadata = json.loads(subprocess.check_output([
+              "cargo", "metadata", "--locked", "--format-version", "1"
+          ]))
+          forbidden = {"tauri", "tauri-build", "tauri-runtime", "tauri-runtime-wry", "wry", "webkit2gtk", "webview2-com"}
+          leaked = sorted({package["name"] for package in metadata["packages"]} & forbidden)
+          assert not leaked, f"Desktop dependencies leaked into the default build: {leaked}"
       - name: Install locked sidecar dependencies
         run: npm ci --prefix scripts
       - name: Check formatting
@@ -58,14 +75,35 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Verify SDK and transport behavior
         run: npm test --prefix scripts
+      - name: Test combined release packaging
+        run: python scripts/test-package-release.py
       - name: Build native release
         run: cargo build --locked --release
       - name: Verify optimized help and offline swarm
         run: |
           "${{ matrix.binary }}" --help
           "${{ matrix.binary }}" demo 'Verify packaged native global-board collaboration and complete worker drain' --agents 500 --no-tui --grace-secs 0 --database release-smoke.sqlite3
+      - name: Install Linux desktop WebView build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Install locked desktop frontend dependencies
+        run: npm ci --prefix desktop
+      - name: Test desktop frontend
+        run: npm test --prefix desktop
+      - name: Check desktop Rust formatting
+        run: cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --all -- --check
+      - name: Test desktop host
+        run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets
+      - name: Check desktop Rust warnings
+        run: cargo clippy --manifest-path desktop/src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+      # Tauri runs the frontend's build/type-check command before building the host.
+      - name: Build desktop release executable
+        working-directory: desktop
+        run: npm run tauri -- build --no-bundle --ci -- --locked
       - name: Package executable and runtime companions
-        run: python scripts/package-release.py --binary "${{ matrix.binary }}" --platform "${{ matrix.platform }}" --output dist
+        run: python scripts/package-release.py --binary "${{ matrix.binary }}" --desktop-binary "${{ matrix.desktop_binary }}" --platform "${{ matrix.platform }}" --output dist
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}

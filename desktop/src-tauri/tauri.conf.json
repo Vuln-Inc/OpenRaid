@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Openraid",
+  "version": "1.1.3",
+  "identifier": "com.vuln-inc.openraid",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Openraid",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 800,
+        "minHeight": 600,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost ws://localhost:1420 ws://127.0.0.1:1420; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'",
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "shortDescription": "Native collaborative agent swarm desktop",
+    "category": "DeveloperTool"
+  }
+}

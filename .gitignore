@@ -5,6 +5,12 @@ __pycache__/
 *.sqlite3-shm
 *.sqlite3-wal
 .env
+.env.*
+!.env.example
+!.env.*.example
+!.env.template
+.openraid/
+/.playwright-mcp/
 node_modules/
 .opencode/goals/
 messageboard.txt

@@ -1,0 +1,55 @@
+@import "tailwindcss";
+@import "./components/theme.css";
+@plugin "tailwindcss-react-aria-components";
+@plugin "tailwindcss-animate";
+@custom-variant dark (&:where(.dark-mode, .dark-mode *));
+@custom-variant label (& [data-label]);
+@custom-variant focus-input-within (&:has(input:focus));
+
+@utility transition-inherit-all {
+  transition-property: inherit;
+  transition-duration: inherit;
+  transition-timing-function: inherit;
+}
+@utility scrollbar-hide {
+  scrollbar-width: none;
+  &::-webkit-scrollbar { display: none; }
+}
+
+/* Keep native runtime themes authoritative, including portalled menus/modals. */
+@layer base {
+  :root, .app, .dark-mode {
+    --color-bg-primary: var(--panel);
+    --color-bg-primary_alt: var(--panel);
+    --color-bg-primary_hover: color-mix(in srgb, var(--panel), var(--text) 5%);
+    --color-bg-secondary: var(--background);
+    --color-bg-secondary_alt: var(--background);
+    --color-bg-secondary_hover: color-mix(in srgb, var(--panel), var(--text) 8%);
+    --color-bg-tertiary: color-mix(in srgb, var(--panel), var(--text) 10%);
+    --color-bg-active: color-mix(in srgb, var(--panel), var(--accent) 12%);
+    --color-bg-brand-solid: var(--accent);
+    --color-bg-brand-solid_hover: color-mix(in srgb, var(--accent), var(--text) 12%);
+    --color-bg-brand-primary_alt: color-mix(in srgb, var(--panel), var(--accent) 12%);
+    --color-text-primary: var(--text);
+    --color-text-secondary: var(--text);
+    --color-text-secondary_hover: var(--text);
+    --color-text-tertiary: var(--muted);
+    --color-text-tertiary_hover: var(--text);
+    --color-text-quaternary: var(--muted);
+    --color-text-placeholder: var(--muted);
+    --color-text-brand-secondary: var(--accent);
+    --color-text-brand-secondary_hover: var(--accent);
+    --color-fg-quaternary: var(--muted);
+    --color-fg-quaternary_hover: var(--text);
+    --color-fg-tertiary: var(--muted);
+    --color-fg-secondary: var(--text);
+    --color-fg-brand-primary: var(--accent);
+    --color-fg-brand-primary_alt: var(--accent);
+    --color-fg-brand-secondary: var(--accent);
+    --color-fg-brand-secondary_alt: var(--accent);
+    --color-border-primary: var(--line);
+    --color-border-secondary: var(--line);
+    --color-border-brand: var(--accent);
+    --color-focus-ring: var(--accent);
+  }
+}

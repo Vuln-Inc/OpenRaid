@@ -12,7 +12,7 @@
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
 [![Verification](https://img.shields.io/badge/verified-354%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
-[**Quick start**](#install-and-launch) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
+[**Quick start**](#install-and-launch) · [**Desktop app**](#optional-desktop-app) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
 </div>
 
@@ -30,6 +30,7 @@ OpenRaid keeps the tool execution, coordination, checkpoints, and completion gat
 
 - [What you get](#what-you-get)
 - [Install and launch](#install-and-launch)
+- [Optional desktop app](#optional-desktop-app)
 - [Your first live session](#your-first-live-session)
 - [Providers, models, and thinking](#providers-models-and-thinking)
 - [Use the interactive console](#use-the-interactive-console)
@@ -147,7 +148,7 @@ Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for publi
 | macOS Intel | `openraid-v1.1.3-darwin-x86_64.tar.gz` |
 | macOS Apple Silicon | `openraid-v1.1.3-darwin-arm64.tar.gz` |
 
-Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. Archives include the documentation and optional SDK runtime companions.
+Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. The release workflow packages both the TUI (`openraid`) and desktop (`openraid-desktop`) executables, documentation, and optional SDK runtime companions in each platform archive. Windows binaries use the `.exe` extension. Launch the desktop executable without CLI arguments; see [desktop requirements](docs/DESKTOP.md#requirements) for WebView prerequisites. Previously published archives are not changed until the workflow is run for a release tag.
 
 ```powershell
 .\openraid.exe setup --workspace "C:\Projects\my-app" --agents 4
@@ -178,6 +179,29 @@ This exercises the real global board, tool bus, voting, and graceful drain witho
 ```
 
 The elapsed time varies. The default five-second consensus grace contributes to that time; it is not a request timeout. Omit `--no-tui` to inspect the dashboard in an interactive terminal.
+
+## Optional desktop app
+
+The optional **Tauri + React desktop app** is a separate executable. The terminal console remains the default: the root `cargo build --release --locked`, `run.bat`, and `run.sh` commands do not build the frontend or require Tauri, a WebView, or Node.js frontend dependencies.
+
+The desktop hosts the same Rust/Tokio swarm **in-process**, rather than launching the CLI. It shares the terminal's workspace configuration, provider credentials in `auth.json`, session catalog, and `.openraid/` SQLite databases. You can close one interface and reopen its saved session in the other; opening history does not automatically replay unfinished work. Avoid running two controllers against the same active session.
+
+The desktop presents the global board, agent roster and completion votes, per-agent generation/tool/command activity, prompt history, and **IDLE / RUNNING / PAUSED / STOPPING** state. Live updates arrive through Tauri events, and virtualized lists keep large rosters manageable. Start, pause, resume, stop, roster changes, model/variant/theme selection, sessions, MCP, and board export use the shared session controls.
+
+Browse sessions, providers, models, thinking variants, and themes using the desktop's **Untitled UI React** controls rather than typing slash commands or raw identifiers. Provider/model/variant selectors combine search and selection in one dropdown. Model choices depend on the provider, thinking choices depend on the model, and opening saved history remains separate from starting work. See the [desktop walkthrough and verification checklist](docs/DESKTOP.md#find-your-way-around).
+
+See [the desktop guide](docs/DESKTOP.md) for platform prerequisites, build/launch commands, and session interoperability. Desktop WebView/build prerequisites are additional to the terminal requirements above; Node.js is needed to build the React frontend, not to run native model transports in the terminal.
+
+Desktop source builds additionally require **Rust 1.90+**, **Node.js 22.12+**, and your platform's [Tauri prerequisites](docs/DESKTOP.md#requirements). Build the separate desktop executable from the checkout root:
+
+```sh
+npm ci --prefix desktop
+npm run tauri --prefix desktop -- build -- --locked
+```
+
+For just the executable without installer bundles, use `npm run tauri --prefix desktop -- build --no-bundle -- --locked`, or the opt-in `build_desktop.bat` / `bash build_desktop.sh` helpers. The executable is `desktop/src-tauri/target/release/openraid-desktop` (`.exe` on Windows), unless `CARGO_TARGET_DIR` is set.
+
+For frontend/desktop development, use `npm run tauri --prefix desktop -- dev`. The desktop host has its own manifest and lockfile under `desktop/src-tauri/`; it is deliberately not a member of the root Cargo workspace. Building the terminal requires none of these desktop steps.
 
 ## Your first live session
 
@@ -721,12 +745,14 @@ The upstream source audit requires **Node.js 22.13+**, fetches the reviewed sour
 | `src/workspace/` | Workspace execution, native tools, shared MCP integration |
 | `scripts/` | Optional SDK sidecar, audits, catalog updates, scale measurements |
 | `tests/` | End-to-end protocol, terminal, membership, persistence, and recovery tests |
+| `desktop/` | Optional React frontend and independently built Tauri desktop host (`src-tauri/`) |
 
-`src/main.rs` owns the CLI, `src/config.rs` the configuration, and `src/lib.rs` the public module map. Imports such as `openraid::runtime` and `openraid::storage` remain stable despite domain-folder organization.
+`src/main.rs` is the terminal entry point; `src/cli.rs` owns CLI parsing and shared provider launch configuration. `src/config.rs` owns runtime configuration, `src/desktop.rs` the transport-independent desktop session facade, and `src/lib.rs` the public module map. Imports such as `openraid::runtime` and `openraid::storage` remain stable despite domain-folder organization.
 
 ### Detailed documentation
 
 - [Providers, authentication, thinking, custom configuration, and MCP](docs/PROVIDERS.md)
+- [Optional desktop app, building, and session interoperability](docs/DESKTOP.md)
 - [Terminal themes and appearance preferences](docs/THEMES.md)
 - [Full verification record and operational limits](docs/VERIFICATION.md)
 - [OpenCode source-provider behavioral audit](docs/SOURCE_PROVIDER_AUDIT.md)

@@ -495,9 +495,10 @@ pub fn ordered_names(variants: &BTreeMap<String, Value>) -> Vec<String> {
         "medium" => 3,
         "high" => 4,
         "xhigh" => 5,
-        "max" => 6,
-        "thinking" => 7,
-        _ => 8,
+        "ultra" => 6,
+        "max" => 7,
+        "thinking" => 8,
+        _ => 9,
     };
     let mut names: Vec<_> = variants.keys().cloned().collect();
     names.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));

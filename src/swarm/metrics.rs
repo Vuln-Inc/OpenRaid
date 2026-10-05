@@ -94,6 +94,24 @@ impl ActivityLog {
         }
         ActivitySnapshot { reader, suffix }
     }
+
+    fn tail_snapshot(&self, max_bytes: usize) -> ActivitySnapshot {
+        let mut snapshot = self.snapshot();
+        if let Some(reader) = snapshot.reader.as_mut() {
+            let length = reader.limit();
+            let start = length.saturating_sub(max_bytes as u64);
+            if reader.get_mut().seek(SeekFrom::Start(start)).is_ok() {
+                reader.set_limit(length - start);
+            } else {
+                snapshot.reader = None;
+                snapshot
+                    .suffix
+                    .push_str("\n[activity log could not be read]\n");
+            }
+        }
+        snapshot.suffix = tail(&snapshot.suffix, max_bytes).to_owned();
+        snapshot
+    }
 }
 
 struct ActivitySnapshot {
@@ -102,6 +120,23 @@ struct ActivitySnapshot {
 }
 
 impl ActivitySnapshot {
+    fn read_tail(mut self, max_bytes: usize) -> String {
+        let mut bytes = Vec::new();
+        if let Some(reader) = self.reader.as_mut() {
+            if reader.read_to_end(&mut bytes).is_err() {
+                self.suffix.push_str("\n[activity log could not be read]\n");
+            }
+        }
+        // The range can begin in the middle of a UTF-8 code point.
+        let start = bytes
+            .iter()
+            .position(|byte| byte & 0xc0 != 0x80)
+            .unwrap_or(bytes.len());
+        let mut text = String::from_utf8_lossy(&bytes[start..]).into_owned();
+        text.push_str(&self.suffix);
+        tail(&text, max_bytes).to_owned()
+    }
+
     fn read(mut self) -> String {
         let mut text = String::new();
         if let Some(reader) = self.reader.as_mut() {
@@ -207,9 +242,20 @@ pub struct MetricsSnapshot {
 pub struct Metrics {
     slots: RwLock<BTreeMap<String, Arc<AgentSlot>>>,
     started: Instant,
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Metrics {
+    /// Coalesced change notifications; subscribers read the latest snapshot.
+    pub fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    fn changed(&self) {
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
     pub fn agent_tail(&self, agent_id: &str, max_bytes: usize) -> String {
         self.slot(agent_id)
             .map(|slot| {
@@ -228,6 +274,7 @@ impl Metrics {
                     .collect(),
             ),
             started: Instant::now(),
+            changes: tokio::sync::watch::channel(0).0,
         }
     }
 
@@ -240,6 +287,7 @@ impl Metrics {
         {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(Arc::new(AgentSlot::default()));
+                self.changed();
                 true
             }
             std::collections::btree_map::Entry::Occupied(_) => false,
@@ -257,6 +305,7 @@ impl Metrics {
     pub fn set_status(&self, agent_id: &str, status: AgentStatus) {
         if let Some(slot) = self.slot(agent_id) {
             slot.status.store(status as u8, Ordering::Relaxed);
+            self.changed();
         }
     }
 
@@ -265,18 +314,21 @@ impl Metrics {
             slot.input_tokens.fetch_add(input, Ordering::Relaxed);
             slot.output_tokens.fetch_add(output, Ordering::Relaxed);
             slot.cached_tokens.fetch_add(cached, Ordering::Relaxed);
+            self.changed();
         }
     }
 
     pub fn record_tool(&self, agent_id: &str) {
         if let Some(slot) = self.slot(agent_id) {
             slot.tools.fetch_add(1, Ordering::Relaxed);
+            self.changed();
         }
     }
 
     pub fn record_retry(&self, agent_id: &str) {
         if let Some(slot) = self.slot(agent_id) {
             slot.retries.fetch_add(1, Ordering::Relaxed);
+            self.changed();
         }
     }
 
@@ -296,6 +348,8 @@ impl Metrics {
             drop(activity);
             let mut preview = slot.stream.lock().unwrap_or_else(|e| e.into_inner());
             append_preview(&mut preview, text, STREAM_PREVIEW_BYTES);
+            drop(preview);
+            self.changed();
         }
     }
 
@@ -308,6 +362,7 @@ impl Metrics {
                 activity.append(&format!("\n\n[status] {text}\n"));
                 activity.response_boundary_needed = true;
                 *detail = preview.to_owned();
+                self.changed();
             }
         }
     }
@@ -321,6 +376,8 @@ impl Metrics {
             let mut activity = slot.activity.lock().unwrap_or_else(|e| e.into_inner());
             activity.append(text);
             activity.response_boundary_needed = true;
+            drop(activity);
+            self.changed();
         }
     }
 
@@ -342,6 +399,21 @@ impl Metrics {
                     .unwrap_or_else(|e| e.into_inner())
                     .snapshot();
                 snapshot.read()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Read a bounded live transcript, including tools and command/PTY output.
+    /// The complete transcript remains available through `agent_activity`.
+    pub fn agent_activity_tail(&self, agent_id: &str, max_bytes: usize) -> String {
+        self.slot(agent_id)
+            .map(|slot| {
+                let snapshot = slot
+                    .activity
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .tail_snapshot(max_bytes);
+                snapshot.read_tail(max_bytes)
             })
             .unwrap_or_default()
     }
@@ -463,6 +535,25 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
+    async fn change_notifications_coalesce_and_include_tool_activity() {
+        let metrics = Metrics::new(1);
+        metrics.append_output("agent-001", "before subscription");
+        let mut changes = metrics.subscribe_changes();
+        assert!(!changes.has_changed().unwrap());
+        metrics.set_status("agent-001", AgentStatus::Tool);
+        metrics.record_tool_start("agent-001", "run_command", "{}");
+        metrics.append_activity("agent-001", "[stdout] hello\n");
+        changes.changed().await.unwrap();
+        assert!(metrics
+            .agent_activity("agent-001")
+            .contains("[stdout] hello"));
+        assert_eq!(metrics.snapshot().agents[0].status, AgentStatus::Tool);
+        assert!(!changes.has_changed().unwrap());
+        metrics.append_output("missing", "ignored");
+        assert!(!changes.has_changed().unwrap());
+    }
+
+    #[tokio::test]
     async fn five_hundred_tasks_account_without_losing_updates() {
         let metrics = Arc::new(Metrics::new(500));
         let mut tasks = tokio::task::JoinSet::new();
@@ -519,6 +610,19 @@ mod tests {
         assert!(metrics.agent_output("agent-001").len() <= STREAM_PREVIEW_BYTES);
         assert!(metrics.agent_activity("agent-002").is_empty());
         assert!(metrics.agent_activity("missing-agent").is_empty());
+    }
+
+    #[test]
+    fn activity_tail_is_bounded_unicode_safe_and_includes_process_output() {
+        let metrics = Metrics::new(1);
+        metrics.append_output("agent-001", &"界".repeat(20_000));
+        metrics.append_activity("agent-001", "\n[stdout] hello\n");
+        let activity = metrics.agent_activity_tail("agent-001", 100);
+        assert!(activity.len() <= 100);
+        assert!(activity.ends_with("[stdout] hello\n"));
+        assert!(!activity.contains('\u{fffd}'));
+        assert!(metrics.agent_activity_tail("agent-001", 0).is_empty());
+        assert!(metrics.agent_activity_tail("missing", 100).is_empty());
     }
 
     #[test]

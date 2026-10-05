@@ -1,5 +1,10 @@
 //! Openraid runs a global-board swarm as lightweight asynchronous tasks.
 
+// Keep historical fully qualified paths in the shared launch implementation.
+extern crate self as openraid;
+
+pub mod cli;
+
 // Domain folders keep related implementation together while these explicit
 // paths preserve the public module names used by the CLI and downstream callers.
 #[path = "credentials/auth.rs"]
@@ -13,6 +18,7 @@ pub mod clipboard;
 pub mod config;
 #[path = "swarm/context.rs"]
 pub mod context;
+pub mod desktop;
 #[path = "credentials/gitlab_oauth.rs"]
 pub mod gitlab_oauth;
 #[path = "workspace/mcp.rs"]

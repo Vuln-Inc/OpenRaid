@@ -27,11 +27,13 @@ pub enum SessionNavigation {
     Open(String),
 }
 
-struct PendingPrompt(Arc<AtomicUsize>);
+struct PendingPrompt(Arc<AtomicUsize>, watch::Sender<u64>);
 
 impl Drop for PendingPrompt {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+        self.1
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
@@ -42,6 +44,7 @@ pub struct SessionControl {
     stop: watch::Sender<bool>,
     round: watch::Sender<bool>,
     busy: watch::Sender<bool>,
+    state_changes: watch::Sender<u64>,
     paused: watch::Sender<bool>,
     work_stopped: watch::Sender<bool>,
     drain_cursor: watch::Sender<u64>,
@@ -109,6 +112,7 @@ impl SessionControl {
         }));
         let (stop, _) = watch::channel(false);
         let (busy, _) = watch::channel(false);
+        let (state_changes, _) = watch::channel(0);
         let (paused, _) = watch::channel(false);
         let (work_stopped, _) = watch::channel(false);
         let (drain_cursor, _) = watch::channel(0);
@@ -117,6 +121,7 @@ impl SessionControl {
             models,
             stop,
             busy,
+            state_changes,
             paused,
             work_stopped,
             drain_cursor,
@@ -239,8 +244,18 @@ impl SessionControl {
     pub fn stop_receiver(&self) -> watch::Receiver<bool> {
         self.stop.subscribe()
     }
+    /// Coalesced notifications for busy/pause/stop transitions, including
+    /// prompt preparation that has not yet reached the durable board.
+    pub fn state_receiver(&self) -> watch::Receiver<u64> {
+        self.state_changes.subscribe()
+    }
+    fn notify_state(&self) {
+        self.state_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
     pub fn detach(&self) {
         self.stop.send_replace(true);
+        self.notify_state();
     }
     pub fn is_closing(&self) -> bool {
         *self.stop.borrow()
@@ -298,8 +313,10 @@ impl SessionControl {
             return Ok(());
         }
         let signal = self.paused.clone();
+        let state = self.state_changes.clone();
         if !self.store.has_started().await? {
             signal.send_replace(paused);
+            self.notify_state();
             return Ok(());
         }
         self.store
@@ -314,6 +331,7 @@ impl SessionControl {
                 self.round.subscribe(),
                 move || {
                     signal.send_replace(paused);
+                    state.send_modify(|revision| *revision = revision.wrapping_add(1));
                 },
             )
             .await?;
@@ -341,6 +359,7 @@ impl SessionControl {
             workspace.stop_processes();
         }
         self.paused.send_replace(false);
+        self.notify_state();
         // Once cancellation is published, its durable bookkeeping must survive
         // a dropped UI/control caller even while another change owns the lock.
         let control = self.clone();
@@ -358,6 +377,7 @@ impl SessionControl {
         let cursor = self.drain_cursor.clone();
         let interruptions = self.interruptions.clone();
         let stop_pending = self.stop_pending.clone();
+        let state = self.state_changes.clone();
         self.store
             .drain_round(
                 if stopped {
@@ -373,6 +393,7 @@ impl SessionControl {
                     round.send_replace(true);
                     paused.send_replace(false);
                     stop_pending.store(false, Ordering::Release);
+                    state.send_modify(|revision| *revision = revision.wrapping_add(1));
                 },
             )
             .await?;
@@ -403,6 +424,7 @@ impl SessionControl {
     }
     pub fn set_busy(&self, busy: bool) {
         self.busy.send_replace(busy);
+        self.notify_state();
     }
 
     pub async fn clear_board(&self) -> Result<()> {
@@ -420,6 +442,7 @@ impl SessionControl {
         self.work_stopped.send_replace(false);
         self.drain_cursor.send_replace(0);
         self.busy.send_replace(true);
+        self.notify_state();
     }
 
     /// Admission is serialized with operator stop. A stop acknowledged after
@@ -437,8 +460,10 @@ impl SessionControl {
             || self.interruptions.load(Ordering::Acquire) != interruption
         {
             self.work_stopped.send_replace(true);
+            self.notify_state();
             return false;
         }
+        self.notify_state();
         true
     }
 
@@ -447,7 +472,8 @@ impl SessionControl {
         ensure!(!text.trim().is_empty(), "prompt must not be empty");
         let interruption = self.interruptions.load(Ordering::Acquire);
         self.pending_prompts.fetch_add(1, Ordering::AcqRel);
-        let _pending = PendingPrompt(self.pending_prompts.clone());
+        self.notify_state();
+        let _pending = PendingPrompt(self.pending_prompts.clone(), self.state_changes.clone());
         // Git capture may traverse a large workspace. Keep it serialized with
         // restore, while leaving pause/stop/model controls responsive.
         let _snapshot = tokio::select! {
@@ -472,10 +498,12 @@ impl SessionControl {
             "prompt cancelled because the owner stopped work while preparing its snapshot"
         );
         let busy = self.busy.clone();
+        let state = self.state_changes.clone();
         let message = self
             .store
             .owner_action("owner", text, self.round.subscribe(), move || {
                 busy.send_replace(true);
+                state.send_modify(|revision| *revision = revision.wrapping_add(1));
             })
             .await?;
         if let Some(tree) = snapshot {
@@ -554,6 +582,38 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn state_notifications_cover_idle_controls_and_busy_transitions() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let harness = crate::runtime::Harness::new(Config {
+            agents: 1,
+            workspace: directory.path().to_owned(),
+            database: directory.path().join("state.sqlite3"),
+            interactive_session: true,
+            mock: true,
+            ..Config::default()
+        })
+        .await?;
+        let control = &harness.control;
+        let mut changes = control.state_receiver();
+        control.pause().await?;
+        changes.changed().await?;
+        assert!(control.is_paused());
+        control.resume().await?;
+        changes.changed().await?;
+        assert!(!control.is_paused());
+        control.set_busy(true);
+        changes.changed().await?;
+        assert!(control.is_busy());
+        control.set_busy(false);
+        changes.changed().await?;
+        assert!(!control.is_busy());
+        control.detach();
+        changes.changed().await?;
+        assert!(control.is_closing());
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn snapshot_preparation_does_not_block_controls_or_escape_an_acknowledged_stop(
     ) -> Result<()> {
@@ -569,6 +629,7 @@ mod tests {
         })
         .await?;
         let control = harness.control.clone();
+        let mut state_changes = control.state_receiver();
         let capture = control.snapshots.lock().await;
         let posting = {
             let control = control.clone();
@@ -576,7 +637,7 @@ mod tests {
         };
         tokio::time::timeout(Duration::from_secs(2), async {
             while !control.is_busy() {
-                tokio::task::yield_now().await;
+                state_changes.changed().await.unwrap();
             }
         })
         .await?;

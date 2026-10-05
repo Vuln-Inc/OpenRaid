@@ -38,7 +38,7 @@ const fn rgb(hex: u32) -> Color {
 
 /// The default comes first; remaining palettes cover cool, warm, and light UI.
 /// Familiar palettes are adapted for readable status text and terminal borders.
-pub static THEMES: [Theme; 10] = [
+pub static THEMES: [Theme; 12] = [
     Theme {
         id: "openraid",
         name: "Openraid",
@@ -227,6 +227,44 @@ pub static THEMES: [Theme; 10] = [
             border: rgb(0x85909e),
             selection: rgb(0xdbe4f2),
             selection_text: rgb(0x20334f),
+        },
+    },
+    Theme {
+        id: "dark",
+        name: "Dark",
+        description: "Neutral charcoal panels with soft periwinkle highlights.",
+        dark: true,
+        palette: Palette {
+            background: rgb(0x101116),
+            surface: rgb(0x181a21),
+            text: rgb(0xe9ebf0),
+            muted: rgb(0xa0a5b5),
+            accent: rgb(0xa6b5ff),
+            success: rgb(0x85dfc2),
+            warning: rgb(0xefcd87),
+            error: rgb(0xee9696),
+            border: rgb(0x30333e),
+            selection: rgb(0x292d40),
+            selection_text: rgb(0xe9ebf0),
+        },
+    },
+    Theme {
+        id: "light",
+        name: "Light",
+        description: "Soft gray canvases, white panels, and indigo highlights.",
+        dark: false,
+        palette: Palette {
+            background: rgb(0xf1f3f8),
+            surface: rgb(0xffffff),
+            text: rgb(0x222638),
+            muted: rgb(0x616779),
+            accent: rgb(0x4358b6),
+            success: rgb(0x18795f),
+            warning: rgb(0x8b5710),
+            error: rgb(0xa92f45),
+            border: rgb(0xd9dce6),
+            selection: rgb(0xdfe4f7),
+            selection_text: rgb(0x222638),
         },
     },
 ];

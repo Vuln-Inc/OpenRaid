@@ -1,0 +1,15 @@
+@layer base {
+.model-picker { min-width: 0; display: flex; flex-direction: column; gap: 18px; }
+.picker-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.picker-heading h2 { margin: 0; font-size: 16px; }
+.picker-heading p, .credential-note, .variant-field small, .picker-actions > span { color: var(--muted); font-size: 12px; line-height: 1.6; }
+.picker-heading button { flex-shrink: 0; }
+.model-current { display: flex; flex-direction: column; gap: 5px; padding: 14px; background: var(--background); border: 1px solid var(--line); border-radius: 12px; overflow-wrap: anywhere; }
+.model-current span, .model-current small { color: var(--muted); font-size: 12px; }
+.model-current strong { font-size: 13px; }
+.model-picker-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px 16px; }
+.variant-field { margin-top: 16px; }
+.picker-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 18px; }
+.picker-error { color: var(--text); border-left: 3px solid var(--accent); padding: 10px; overflow-wrap: anywhere; }
+@media (max-width: 620px) { .model-picker-grid { grid-template-columns: minmax(0, 1fr); } .picker-heading { flex-direction: column; } }
+}
