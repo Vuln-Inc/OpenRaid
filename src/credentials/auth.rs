@@ -1,5 +1,5 @@
-//! Local credentials and remembered launcher choices. OpenCode API credentials
-//! are read as a fallback, so a connected provider works in either application.
+//! Local credentials and remembered launcher choices. OpenCode credentials are
+//! available as a fallback only after an explicit import decision.
 
 use crate::config::Config;
 use anyhow::{bail, Context, Result};
@@ -84,6 +84,8 @@ impl LaunchProfile {
 // credentials, including inherited OpenCode tokens.
 #[derive(Default, Serialize, Deserialize)]
 struct AuthData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opencode_import_consent: Option<bool>,
     #[serde(default)]
     providers: BTreeMap<String, Credential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +125,7 @@ enum Credential {
 pub struct AuthStore {
     path: PathBuf,
     opencode_path: Option<PathBuf>,
+    opencode_import_enabled: bool,
     data: AuthData,
 }
 
@@ -132,11 +135,13 @@ impl AuthStore {
     }
 
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
-        Self::load_with_opencode(path, default_opencode_path())
+        let mut store = Self::load_with_opencode(path, default_opencode_path())?;
+        store.opencode_import_enabled = store.data.opencode_import_consent == Some(true);
+        Ok(store)
     }
 
-    /// A separate OpenCode path also makes migration and isolated installations
-    /// possible without changing global process environment variables.
+    /// Explicitly opt in to the supplied OpenCode credential source. A separate
+    /// path supports migration and isolated installations without global env changes.
     pub fn load_with_opencode(
         path: impl Into<PathBuf>,
         opencode_path: Option<PathBuf>,
@@ -146,6 +151,7 @@ impl AuthStore {
         Ok(Self {
             path,
             opencode_path,
+            opencode_import_enabled: true,
             data,
         })
     }
@@ -154,7 +160,26 @@ impl AuthStore {
         &self.path
     }
     pub fn import_path(&self) -> Option<&Path> {
-        self.opencode_path.as_deref()
+        self.opencode_path
+            .as_deref()
+            .filter(|_| self.opencode_import_enabled)
+    }
+    pub fn opencode_import_consent(&self) -> Option<bool> {
+        self.data.opencode_import_consent
+    }
+    /// Detection does not deserialize or expose credentials before consent.
+    pub fn opencode_import_available(&self) -> bool {
+        self.opencode_path.as_deref().is_some_and(Path::is_file)
+    }
+    pub fn set_opencode_import_consent(&mut self, enabled: bool) -> Result<()> {
+        let previous = self.data.opencode_import_consent;
+        self.data.opencode_import_consent = Some(enabled);
+        if let Err(error) = self.save() {
+            self.data.opencode_import_consent = previous;
+            return Err(error);
+        }
+        self.opencode_import_enabled = enabled;
+        Ok(())
     }
     pub fn connection_endpoint(&self, provider: &str) -> Option<&str> {
         self.data.endpoints.get(provider).map(String::as_str)
@@ -200,7 +225,7 @@ impl AuthStore {
         if let Some(credential) = self.data.providers.get(provider_id) {
             return credential_key(credential, provider_id);
         }
-        if let Some(path) = &self.opencode_path {
+        if let Some(path) = self.import_path() {
             let imported: BTreeMap<String, Credential> = read_json(path)?.unwrap_or_default();
             if let Some(credential) = imported.get(provider_id) {
                 return credential_key(credential, provider_id);
@@ -232,7 +257,7 @@ impl AuthStore {
         if let Some(credential) = self.data.providers.get(provider_id) {
             return oauth_value(credential);
         }
-        if let Some(path) = &self.opencode_path {
+        if let Some(path) = self.import_path() {
             let imported: BTreeMap<String, Credential> = read_json(path)?.unwrap_or_default();
             if let Some(credential) = imported.get(provider_id) {
                 return oauth_value(credential);
@@ -247,7 +272,7 @@ impl AuthStore {
         if let Some(credential) = self.data.providers.get(provider_id) {
             return Ok(credential_metadata(credential));
         }
-        if let Some(path) = &self.opencode_path {
+        if let Some(path) = self.import_path() {
             let imported: BTreeMap<String, Credential> = read_json(path)?.unwrap_or_default();
             if let Some(credential) = imported.get(provider_id) {
                 return Ok(credential_metadata(credential));
@@ -536,6 +561,87 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_credentials_require_consent_and_decision_survives_reload() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("auth.json");
+        let imported = root.path().join("opencode.json");
+        fs::write(
+            &imported,
+            r#"{
+            "fixture-api":{"type":"api","key":"imported-key","metadata":{"accountId":"fixture-account"}},
+            "fixture-oauth":{"type":"oauth","access":"imported-access","refresh":"imported-refresh"}
+        }"#,
+        )?;
+        let mut auth = AuthStore::load(&path)?;
+        // Replace only the candidate source; the default loader's consent policy
+        // stays intact without mutating process-wide environment in parallel tests.
+        auth.opencode_path = Some(imported.clone());
+        assert!(auth.opencode_import_available());
+        assert_eq!(auth.opencode_import_consent(), None);
+        assert!(auth.import_path().is_none());
+        assert!(auth.api_key("fixture-api", &[])?.is_none());
+        assert!(auth.oauth("fixture-oauth")?.is_none());
+        assert_eq!(
+            auth.provider_metadata("fixture-api")?,
+            serde_json::json!({})
+        );
+
+        auth.set_opencode_import_consent(false)?;
+        let mut declined = AuthStore::load(&path)?;
+        declined.opencode_path = Some(imported.clone());
+        assert_eq!(declined.opencode_import_consent(), Some(false));
+        assert!(declined.api_key("fixture-api", &[])?.is_none());
+        declined.set_opencode_import_consent(true)?;
+
+        let mut accepted = AuthStore::load(&path)?;
+        accepted.opencode_path = Some(imported.clone());
+        assert_eq!(accepted.opencode_import_consent(), Some(true));
+        assert_eq!(
+            accepted.api_key("fixture-api", &[])?.as_deref(),
+            Some("imported-key")
+        );
+        assert_eq!(
+            accepted.oauth("fixture-oauth")?.unwrap()["access"],
+            "imported-access"
+        );
+        assert_eq!(
+            accepted.provider_metadata("fixture-api")?["accountId"],
+            "fixture-account"
+        );
+        accepted.set_api_key("fixture-api", "local-key")?;
+        assert_eq!(
+            accepted.api_key("fixture-api", &[])?.as_deref(),
+            Some("local-key")
+        );
+        accepted.set_opencode_import_consent(false)?;
+        assert!(accepted.oauth("fixture-oauth")?.is_none());
+        assert_eq!(
+            accepted.api_key("fixture-api", &[])?.as_deref(),
+            Some("local-key")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(imported)?)?["fixture-api"]
+                ["key"],
+            "imported-key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detection_and_declined_import_do_not_parse_opencode_credentials() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let imported = root.path().join("opencode.json");
+        fs::write(&imported, "not valid json")?;
+        let mut auth = AuthStore::load(root.path().join("auth.json"))?;
+        auth.opencode_path = Some(imported);
+        assert!(auth.opencode_import_available());
+        assert!(auth.api_key("fixture", &[])?.is_none());
+        auth.set_opencode_import_consent(false)?;
+        assert!(auth.oauth("fixture")?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn source_loader_token_aliases_override_saved_keys_without_treating_account_as_secret(

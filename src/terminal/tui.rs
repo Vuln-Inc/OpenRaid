@@ -13,6 +13,9 @@ mod inspection_tests;
 mod roster_tests;
 #[path = "selection.rs"]
 mod selection;
+#[cfg(test)]
+#[path = "session_restoration_tests.rs"]
+mod session_restoration_tests;
 use crate::{
     metrics::{AgentStatus, Metrics, MetricsSnapshot},
     quick::{Entry, ProviderManager},
@@ -273,7 +276,13 @@ impl UiState {
     }
 
     async fn load(&mut self, store: &Store) -> Result<()> {
+        let previous_latest = self.latest;
         self.latest = store.latest_seq().await?;
+        if let Some(prompt) = store.latest_task_prompt().await? {
+            self.session.objective = prompt.body;
+        } else if previous_latest > 0 {
+            self.session.objective.clear();
+        }
         if self.follow {
             self.after = self.latest.saturating_sub(PAGE_SIZE as u64);
         }
@@ -1077,6 +1086,19 @@ async fn perform(action: Action, manager: ProviderManager, store: Store) -> Resu
         }
         Action::Models => Ok(JobResult::Open(Kind::Models, manager.models().await?)),
         Action::Connect => Ok(JobResult::Open(Kind::Connect, manager.providers()?)),
+        Action::ConfirmImportOpenCode => Ok(JobResult::Open(
+            Kind::ImportOpenCode,
+            vec![
+                Entry { id: "cancel".into(), label: "Cancel — keep current settings".into(), detail: "No OpenCode information will be imported".into() },
+                Entry { id: "import".into(), label: "Use OpenCode authentication and providers".into(), detail: "Existing OpenRaid credentials take priority; active work keeps its current model".into() },
+            ],
+        )),
+        Action::ImportOpenCode => {
+            manager.import_opencode()?;
+            Ok(JobResult::LifecycleChanged(
+                "OpenCode import enabled. Imported accounts and providers are available in /models and /connect.".into(),
+            ))
+        }
         Action::Variants => Ok(JobResult::Open(Kind::Variants, manager.variants().await?)),
         Action::Cycle => {
             manager.cycle_variant().await?;
@@ -1554,6 +1576,7 @@ async fn run_console(
                                 action,
                                 Action::Models
                                     | Action::Connect
+                                    | Action::ConfirmImportOpenCode
                                     | Action::Variants
                                     | Action::JumpList
                                     | Action::Jump(_)

@@ -297,3 +297,41 @@ async fn desktop_model_selection_snapshot_tracks_variant_changes_and_default() -
     desktop.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_idle_reopen_exposes_resume_for_unfinished_saved_task_only() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let settings = config(root.path(), 1);
+    let store = Store::open(&settings.database).await?;
+    store.initialize_membership(1, false).await?;
+    store
+        .append("owner", "saved task can resume from idle desktop", true)
+        .await?;
+    let desktop = DesktopSession::new(settings.clone()).await?;
+    let snapshot = desktop.snapshot().await?;
+    assert_eq!(snapshot.state, openraid::desktop::DesktopState::Idle);
+    assert!(
+        snapshot.resumable,
+        "idle reopened window must expose saved task recovery"
+    );
+    assert_eq!(desktop.metrics().snapshot().tools, 0);
+    desktop.control().resume().await?;
+    let completion = tokio::time::timeout(Duration::from_secs(5), async {
+        while store.unfinished_prompt().await?.is_some() || desktop.control().is_busy() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    desktop.shutdown().await?;
+    completion??;
+    assert!(!desktop.snapshot().await?.resumable);
+    assert_eq!(store.prompts().await?.len(), 1);
+    let completed = DesktopSession::new(settings).await?;
+    assert!(
+        !completed.snapshot().await?.resumable,
+        "completed history must not offer task recovery"
+    );
+    completed.shutdown().await?;
+    Ok(())
+}

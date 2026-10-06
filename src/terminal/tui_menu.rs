@@ -20,6 +20,7 @@ pub enum Kind {
     Board,
     ClearBoard,
     Connect,
+    ImportOpenCode,
     Models,
     Themes,
     Variants,
@@ -54,6 +55,8 @@ pub enum Action {
     Themes,
     SelectTheme(String),
     Connect,
+    ConfirmImportOpenCode,
+    ImportOpenCode,
     Variants,
     Cycle,
     JumpList,
@@ -129,6 +132,10 @@ pub fn command(text: &str) -> Option<Action> {
                 .unwrap_or(Action::Models),
         ),
         "/connect" => Some(Action::Connect),
+        "/import-opencode" => Some(match words.next() {
+            None => Action::ConfirmImportOpenCode,
+            Some(_) => Action::InvalidCommand("Usage: /import-opencode".into()),
+        }),
         "/themes" | "/theme" => Some(match words.next() {
             None => Action::Themes,
             Some(id) if words.next().is_none() => Action::SelectTheme(id.into()),
@@ -286,6 +293,11 @@ impl Menu {
                     "/connect",
                     "Connect a provider",
                     "Ctrl+X then C · save a key securely",
+                ),
+                (
+                    "/import-opencode",
+                    "Import existing OpenCode information",
+                    "Choose whether to use saved accounts, API keys and custom providers",
                 ),
                 (
                     "/themes",
@@ -485,6 +497,13 @@ impl Menu {
                             Outcome::Close
                         }
                     }
+                    Kind::ImportOpenCode => {
+                        if entry.id == "import" {
+                            Outcome::Action(Action::ImportOpenCode)
+                        } else {
+                            Outcome::Close
+                        }
+                    }
                     Kind::Commands => Outcome::Action(command(&entry.id).unwrap()),
                     Kind::Sessions => Outcome::Action(Action::OpenSession(entry.id.clone())),
                     Kind::Connect => Outcome::Provider(entry.id.clone()),
@@ -527,6 +546,7 @@ impl Menu {
         let (title, help) = match &self.kind {
             Kind::Board => (" Messageboard controls ", "Export includes every message, not only the visible page"),
             Kind::ClearBoard => (" WARNING: permanently clear history? ", "Deletes messages, prompts/snapshots, checkpoints and votes. Workspace and roster remain. Esc cancels."),
+            Kind::ImportOpenCode => (" Use existing OpenCode information? ", "Use OpenCode API keys, OAuth accounts and custom providers. Your choice is remembered. Esc cancels."),
             Kind::Sessions => (" /sessions · this workspace ", "Enter opens the selected session when idle · /new creates fresh history"),
             Kind::Members => (
                 " /members · parallel agents ",
@@ -846,6 +866,42 @@ mod bulk_tests {
                 detail: String::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn opencode_import_requires_confirmation_and_is_discoverable() {
+        assert!(matches!(
+            command("/import-opencode"),
+            Some(Action::ConfirmImportOpenCode)
+        ));
+        assert!(matches!(
+            command("/import-opencode yes"),
+            Some(Action::InvalidCommand(_))
+        ));
+        assert!(Menu::commands()
+            .entries
+            .iter()
+            .any(|entry| entry.id == "/import-opencode"));
+        let entries = vec![
+            Entry {
+                id: "cancel".into(),
+                label: "Cancel".into(),
+                detail: String::new(),
+            },
+            Entry {
+                id: "import".into(),
+                label: "Import".into(),
+                detail: String::new(),
+            },
+        ];
+        let mut menu = Menu::new(Kind::ImportOpenCode, entries.clone(), None);
+        assert!(matches!(menu.key(key(KeyCode::Enter)), Outcome::Close));
+        let mut menu = Menu::new(Kind::ImportOpenCode, entries, None);
+        menu.key(key(KeyCode::Down));
+        assert!(matches!(
+            menu.key(key(KeyCode::Enter)),
+            Outcome::Action(Action::ImportOpenCode)
+        ));
     }
 
     #[test]

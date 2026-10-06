@@ -591,6 +591,36 @@ fn provider_connected(provider: &openraid::catalog::ProviderInfo, auth: &AuthSto
             .is_some_and(|key| !key.trim().is_empty())
 }
 
+fn opencode_import_status(auth: &AuthStore, workspace: &std::path::Path) -> Value {
+    json!({
+        "available": auth.opencode_import_available()
+            || openraid::catalog::Catalog::opencode_import_available(workspace),
+        "consent": auth.opencode_import_consent()
+    })
+}
+
+/// Safe before opening a workspace: only file existence and the persisted
+/// decision are exposed, never provider names, keys or account metadata.
+#[tauri::command]
+fn desktop_opencode_status(workspace: PathBuf) -> std::result::Result<Value, String> {
+    let auth = AuthStore::load_default().map_err(error)?;
+    Ok(opencode_import_status(&auth, &workspace))
+}
+
+#[tauri::command]
+async fn desktop_import_opencode(
+    state: State<'_, DesktopState>,
+    workspace: PathBuf,
+    enabled: bool,
+) -> std::result::Result<Value, String> {
+    let _guard = state.commands.lock().await;
+    let mut auth = AuthStore::load_default().map_err(error)?;
+    auth.set_opencode_import_consent(enabled).map_err(error)?;
+    // Subsequent catalog queries/model selections read the updated consent.
+    // Persisting a preference must not replace an active runtime or abandon work.
+    Ok(opencode_import_status(&auth, &workspace))
+}
+
 #[tauri::command]
 fn desktop_sessions() -> std::result::Result<Value, String> {
     serde_json::to_value(openraid::session_catalog::list(None).map_err(error)?)
@@ -618,12 +648,13 @@ async fn desktop_mcp(state: State<'_, DesktopState>) -> std::result::Result<Valu
 async fn shutdown(state: &DesktopState) -> Result<()> {
     let active = state.session.lock().await.clone();
     if let Some(session) = active {
-        session.control().stop_work().await?;
+        // Interrupt workers before waiting on an in-flight command, while
+        // retaining the unfinished prompt/checkpoint for a future reopen.
+        session.control().detach();
     }
     let _guard = state.commands.lock().await;
     let session = state.session.lock().await.take();
     if let Some(session) = session {
-        session.control().stop_work().await?;
         session.shutdown().await?;
     }
     Ok(())
@@ -654,6 +685,8 @@ pub fn run() {
             desktop_sessions,
             desktop_themes,
             desktop_mcp,
+            desktop_opencode_status,
+            desktop_import_opencode,
             desktop_close
         ])
         .on_window_event(|window, event| {
@@ -677,6 +710,25 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_status_detects_sources_without_exposing_or_parsing_them() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let imported = root.path().join("opencode.json");
+        // Detection must remain safe even if another application's config is
+        // malformed, or contains credentials that should not enter IPC output.
+        std::fs::write(&imported, "DESKTOP_IMPORT_SECRET invalid json")?;
+        let mut auth =
+            AuthStore::load_with_opencode(root.path().join("auth.json"), Some(imported))?;
+        let status = opencode_import_status(&auth, root.path());
+        assert_eq!(status, json!({"available": true, "consent": null}));
+        assert!(!status.to_string().contains("DESKTOP_IMPORT_SECRET"));
+        auth.set_opencode_import_consent(false)?;
+        assert_eq!(opencode_import_status(&auth, root.path())["consent"], false);
+        auth.set_opencode_import_consent(true)?;
+        assert_eq!(opencode_import_status(&auth, root.path())["consent"], true);
+        Ok(())
+    }
 
     #[test]
     fn reopening_the_current_workspace_reattaches_without_replacing_runtime() {

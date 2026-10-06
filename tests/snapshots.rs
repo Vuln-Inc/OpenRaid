@@ -27,11 +27,17 @@ async fn restore_reverts_workspace_changes_without_touching_user_index_or_databa
     std::fs::write(&file, "user content before the prompt")?;
     let database = root.path().join("session.sqlite3");
     std::fs::write(&database, "before")?;
+    let activity = openraid::metrics::activity_directory(&database);
+    std::fs::create_dir(&activity)?;
+    let transcript = activity.join("agent-001.log");
+    std::fs::write(&transcript, "before prompt")?;
     let tree = snapshots::capture(root.path(), &database).await?;
     git(root.path(), &["gc", "--prune=now"]);
     std::fs::write(&file, "agent change")?;
     std::fs::write(root.path().join("added.txt"), "agent created this")?;
     std::fs::write(&database, "new database state")?;
+    std::fs::write(&transcript, "complete activity after prompt")?;
+    std::fs::write(activity.join("agent-002.log"), "new agent history")?;
     snapshots::restore(root.path(), &database, &tree).await?;
     assert_eq!(
         std::fs::read_to_string(&file)?,
@@ -39,6 +45,14 @@ async fn restore_reverts_workspace_changes_without_touching_user_index_or_databa
     );
     assert!(!root.path().join("added.txt").exists());
     assert_eq!(std::fs::read_to_string(&database)?, "new database state");
+    assert_eq!(
+        std::fs::read_to_string(&transcript)?,
+        "complete activity after prompt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(activity.join("agent-002.log"))?,
+        "new agent history"
+    );
     assert_eq!(git(root.path(), &["write-tree"]), original_index);
     Ok(())
 }

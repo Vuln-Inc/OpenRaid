@@ -65,13 +65,14 @@ npm run tauri --prefix desktop -- build -- --locked
 Bundle outputs are under the desktop target's `release/bundle/` directory.
 Build for each platform on that platform with the required native toolchain;
 signing/notarization and distribution prerequisites are additional steps.
-The release workflow packages the TUI and desktop executables together in each
-platform archive. Windows uses `.zip`; Linux and macOS use `.tar.gz`. The desktop
-frontend is embedded in its executable, so frontend sources and Node dependencies
-are not shipped. Archives include desktop license notices and shared SDK runtime
-companions. Installers/app bundles are not produced by the release workflow;
-build those separately with the bundling command above. Existing published
-archives are unchanged until a release-tag workflow run uploads new archives.
+The release workflow publishes only `openraid.exe`, `openraid-desktop.exe`, and
+`LICENSE` as standalone Windows assets. The desktop frontend is embedded in its
+executable, and its icon attribution is included in the published `LICENSE`.
+Linux and macOS builds remain verified in CI and available through source builds.
+Specialized provider SDK companions can be obtained from the source checkout.
+Build installers/app bundles separately with the bundling command above.
+Rerunning a release-tag workflow replaces old archive/checksum assets with this
+executable-only layout.
 
 For local development:
 
@@ -95,18 +96,23 @@ SQLite session format:
 
 - The workspace's first database is `.openraid/openraid.sqlite3`.
 - Separate sessions have databases under `.openraid/sessions/`.
+- Complete agent activity and usage metadata live in a directory beside each
+  database, named `<database filename>.activity`; keep it with session backups.
 - Credentials/preferences use `openraid/auth.json` under `XDG_DATA_HOME`,
   or `~/.local/share` when unset. `OPENRAID_AUTH_FILE` overrides this location.
 - Session catalog metadata lives beside that auth file in `sessions/`.
-- Workspace configuration follows the normal `openraid.json`,
-  `openraid.jsonc`, `opencode.json`, and `opencode.jsonc` lookup order.
+- OpenCode configuration and credential fallback require a remembered import
+  decision. OpenRaid configuration or an explicit file overrides imported
+  global/workspace OpenCode definitions.
 
 See [configuration](../README.md#configuration-reference) for global overlays,
 environment variables, provider setup, and custom database paths.
 
-To hand a session between interfaces, stop or close the active interface first,
-then open the same workspace and saved session in the other. Opening saved
-history is not permission to replay unfinished commands automatically. Avoid
+To continue a session in the other interface, close the active interface first,
+then open the same workspace and saved session in the other. The previous task,
+pause state, agent transcripts, usage, and roster are restored; **Resume**
+explicitly continues unfinished work. **Stop** abandons the current task instead.
+Opening saved history does not replay unfinished commands automatically. Avoid
 running two independent swarm runtimes against the same session at once:
 SQLite sharing is not a cross-process worker-ownership lock.
 
@@ -127,7 +133,11 @@ use provider/model changes to turn a demo into a real run. To use a real
 provider, close and reopen the desktop, then open the workspace without the
 demo option.
 
-Opening a real workspace resolves its current provider configuration first.
+When existing OpenCode information is detected before opening a workspace,
+the desktop asks whether to reuse it. **Keep separate** is the default, and
+the choice is remembered. **Import from OpenCode** in Settings lets you enable
+import later after confirmation, then refreshes the provider/model choices.
+Opening a real workspace resolves its current provider configuration.
 If missing credentials prevent it from opening, connect that provider through
 the [shared authentication flow](PROVIDERS.md#credentials-and-remembered-selections)
 or its supported environment variables, then retry. Desktop provider guidance
@@ -221,10 +231,10 @@ The session state is **IDLE**, **RUNNING**, **PAUSED**, or **STOPPING**.
   The output is formatted JSON; relative export paths resolve inside the
   current workspace.
 
-Closing the native desktop window stops active work, then drains the runtime
-and flushes the database. This is different from the terminal guided console's
-graceful detach behavior: explicitly canceled work is not automatically resumed
-on reopening. For a deliberate immediate stop, use **Stop** before closing.
+Closing the native desktop window gracefully detaches, drains admitted work,
+and flushes the database, preserving unfinished work for an explicit **Resume**
+after reopening. This matches the terminal guided console. For a deliberate
+immediate stop, use **Stop** before closing; stopped tasks remain audit-only.
 
 The swarm has the same OS privileges in either UI. Opening a workspace is not
 a sandbox: agents can run native commands, and configured MCP servers may
@@ -290,7 +300,7 @@ npm run tauri --prefix desktop -- build --no-bundle -- --locked
 
 The single `release.yml` workflow verifies the terminal dependency graph before
 installing desktop/WebView prerequisites, then checks and builds both executables
-on each native platform. Packaging tests verify combined archives and checksums;
+on each native platform. Packaging tests enforce the executable/license allowlist;
 matching TUI/desktop versions are required. Publication waits for all platform
 jobs. Consult actual workflow results before claiming platform acceptance.
 
@@ -346,8 +356,8 @@ a Windows build or screenshots alone do not verify them.
 | `desktop/src/` | React views, state/event bridge, and virtualized lists |
 | `desktop/src-tauri/` | Optional Tauri host, native command boundary, events, capabilities, and packaging |
 | `build_desktop.sh`, `build_desktop.bat` | Opt-in desktop build helpers |
-| `.github/workflows/release.yml` | Shared TUI/desktop verification, platform archives, and release publication |
-| `scripts/package-release.py`, `scripts/test-package-release.py` | Combined executable packaging and archive/version regression tests |
+| `.github/workflows/release.yml` | Shared TUI/desktop verification and executable-only release publication |
+| `scripts/package-release.py`, `scripts/test-package-release.py` | Standalone executable/license staging and asset/version regression tests |
 
 Credentials and provider secrets must remain in native code, not in snapshots
 sent to React. The desktop WebView has no general-purpose shell or filesystem

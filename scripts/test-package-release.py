@@ -1,17 +1,15 @@
-"""Release archive contracts; uses fake binaries and never opens a desktop window."""
-import hashlib
+"""Standalone release asset contracts; never opens a desktop window."""
 import importlib.util
 from contextlib import redirect_stdout
 import io
 from pathlib import Path
-import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
-import zipfile
 
 
 spec = importlib.util.spec_from_file_location("package_release", Path(__file__).with_name("package-release.py"))
+assert spec is not None and spec.loader is not None
 release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
@@ -48,40 +46,46 @@ class ReleasePackagingTests(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def test_all_platform_archives_include_both_executables_and_companions(self):
-        for platform in ["linux-x86_64", "windows-x86_64", "darwin-x86_64", "darwin-arm64"]:
-            with self.subTest(platform=platform):
-                suffix = ".exe" if platform.startswith("windows-") else ""
-                tui = self.binary(f"openraid{suffix}", b"terminal executable")
-                desktop = self.binary(f"openraid-desktop{suffix}", b"desktop executable")
-                with redirect_stdout(io.StringIO()), patch.object(release.subprocess, "check_output", return_value="openraid 1.2.3\n") as execute:
-                    archive = release.package_release(self.root, tui, platform, self.root / "dist", desktop)
-                # Only the terminal's --version is executed; GUI binaries are copied.
-                execute.assert_called_once_with([str(tui.resolve()), "--version"], text=True)
-                prefix = f"openraid-v1.2.3-{platform}/"
-                if suffix:
-                    with zipfile.ZipFile(archive) as packaged:
-                        contents = {name.removeprefix(prefix): packaged.read(name) for name in packaged.namelist()}
-                else:
-                    with tarfile.open(archive) as packaged:
-                        contents = {member.name.removeprefix(prefix): packaged.extractfile(member).read()
-                                    for member in packaged.getmembers() if member.isfile()}
-                        for executable in [tui.name, desktop.name]:
-                            self.assertTrue(packaged.getmember(prefix + executable).mode & 0o111)
-                self.assertEqual(contents[tui.name], b"terminal executable")
-                self.assertEqual(contents[desktop.name], b"desktop executable")
-                for path in ["scripts/sdk-bridge.mjs", "scripts/http-transport.mjs", "docs/DESKTOP.md", "LICENSE", "licenses/untitled-ui.txt"]:
-                    self.assertIn(path, contents)
-                self.assertIn(desktop.name, contents["START-HERE.txt"].decode())
-                expected = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n"
-                self.assertEqual(Path(str(archive) + ".sha256").read_text(encoding="ascii"), expected)
+    def test_release_contains_only_executables_and_combined_license(self):
+        tui = self.binary("openraid.exe", b"terminal executable")
+        desktop = self.binary("openraid-desktop.exe", b"desktop executable")
+        with redirect_stdout(io.StringIO()), patch.object(release.subprocess, "check_output", return_value="openraid 1.2.3\n") as execute:
+            output = release.package_release(self.root, tui, "windows-x86_64", self.root / "dist", desktop)
+        execute.assert_called_once_with([str(tui.resolve()), "--version"], text=True)
+        contents = {path.name: path.read_bytes() for path in output.iterdir()}
+        self.assertEqual(set(contents), {"openraid.exe", "openraid-desktop.exe", "LICENSE"})
+        self.assertEqual(contents[tui.name], b"terminal executable")
+        self.assertEqual(contents[desktop.name], b"desktop executable")
+        self.assertIn(b"Project license", contents["LICENSE"])
+        self.assertIn(b"Untitled UI license", contents["LICENSE"])
 
     def test_terminal_only_packaging_remains_supported(self):
-        tui = self.binary("openraid", b"terminal executable")
+        tui = self.binary("openraid.exe", b"terminal executable")
         with redirect_stdout(io.StringIO()), patch.object(release.subprocess, "check_output", return_value="openraid 1.2.3"):
-            archive = release.package_release(self.root, tui, "linux-x86_64", self.root / "dist")
-        with tarfile.open(archive) as packaged:
-            self.assertFalse(any("openraid-desktop" in member.name for member in packaged.getmembers()))
+            output = release.package_release(self.root, tui, "windows-x86_64", self.root / "dist")
+        self.assertEqual({path.name for path in output.iterdir()}, {"openraid.exe", "LICENSE"})
+        self.assertEqual((output / "LICENSE").read_text(encoding="utf-8"), "Project license")
+
+    def test_non_windows_assets_are_rejected(self):
+        for platform in ["linux-x86_64", "darwin-x86_64", "darwin-arm64"]:
+            with self.subTest(platform=platform), self.assertRaisesRegex(SystemExit, "Windows .exe"):
+                release.package_release(self.root, self.root / "missing", platform, self.root / "dist")
+        self.assertFalse((self.root / "dist").exists())
+
+    def test_old_archives_or_directories_in_output_are_rejected(self):
+        tui = self.binary("openraid.exe", b"terminal executable")
+        output = self.root / "dist"
+        output.mkdir()
+        (output / "old.zip").write_bytes(b"old archive")
+        with patch.object(release.subprocess, "check_output", return_value="openraid 1.2.3"):
+            with self.assertRaisesRegex(SystemExit, "unexpected entries"):
+                release.package_release(self.root, tui, "windows-x86_64", output)
+        self.assertEqual({path.name for path in output.iterdir()}, {"old.zip"})
+        (output / "old.zip").unlink()
+        (output / "LICENSE").mkdir()
+        with patch.object(release.subprocess, "check_output", return_value="openraid 1.2.3"):
+            with self.assertRaisesRegex(SystemExit, "unexpected entries"):
+                release.package_release(self.root, tui, "windows-x86_64", output)
 
     def test_mismatched_desktop_versions_reject_the_release(self):
         for name in ["desktop/src-tauri/Cargo.toml", "desktop/src-tauri/tauri.conf.json", "desktop/package.json"]:
@@ -99,22 +103,22 @@ class ReleasePackagingTests(unittest.TestCase):
             release.verify_tag(self.root, "main")
 
     def test_missing_desktop_executable_does_not_produce_partial_artifacts(self):
-        tui = self.binary("openraid", b"terminal executable")
+        tui = self.binary("openraid.exe", b"terminal executable")
         with self.assertRaises(FileNotFoundError):
-            release.package_release(self.root, tui, "linux-x86_64", self.root / "dist", self.root / "missing")
+            release.package_release(self.root, tui, "windows-x86_64", self.root / "dist", self.root / "missing")
         self.assertFalse((self.root / "dist").exists())
 
     def test_wrong_terminal_binary_version_rejects_packaging(self):
-        tui = self.binary("openraid", b"terminal executable")
+        tui = self.binary("openraid.exe", b"terminal executable")
         with patch.object(release.subprocess, "check_output", return_value="openraid 9.9.9"):
             with self.assertRaisesRegex(SystemExit, "Executable version mismatch"):
-                release.package_release(self.root, tui, "linux-x86_64", self.root / "dist")
+                release.package_release(self.root, tui, "windows-x86_64", self.root / "dist")
         self.assertFalse((self.root / "dist").exists())
 
     def test_desktop_binary_cannot_shadow_the_terminal_executable(self):
-        tui = self.binary("openraid", b"terminal executable")
+        tui = self.binary("openraid.exe", b"terminal executable")
         with self.assertRaisesRegex(SystemExit, "Expected desktop executable"):
-            release.package_release(self.root, tui, "linux-x86_64", self.root / "dist", tui)
+            release.package_release(self.root, tui, "windows-x86_64", self.root / "dist", tui)
         self.assertFalse((self.root / "dist").exists())
 
 

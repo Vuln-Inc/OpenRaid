@@ -6,15 +6,19 @@ export interface Agent { id: string; status: string; input_tokens: number; outpu
 export interface Vote { agent_id: string; done: boolean; reason: string; board_seq: number }
 export interface Snapshot {
   state: "IDLE" | "RUNNING" | "PAUSED" | "STOPPING";
+  resumable?: boolean;
   workspace: string; database: string; session_id: string | null; model: string; provider: string; variant?: string | null;
   agents: Agent[]; votes: Vote[]; board: Message[]; prompts: Message[]; latest_seq: number; runtime_error: string | null;
 }
 export type ControlResult = Snapshot | { text: string; restored: boolean } | { path: string };
 export interface ThemeInfo { active: string; themes: { id: string; dark: boolean; palette?: Record<string, string> }[] }
+export interface OpencodeStatus { available: boolean; consent: boolean | null }
 export function isSnapshot(value: ControlResult): value is Snapshot { return "state" in value && "agents" in value; }
 export const native = {
   snapshot: () => invoke<Snapshot | null>("desktop_snapshot"),
   open: (workspace: string, mock: boolean) => invoke<Snapshot>("desktop_open", { request: { workspace, mock } }),
+  opencodeStatus: (workspace: string) => invoke<OpencodeStatus>("desktop_opencode_status", { workspace }),
+  importOpencode: (workspace: string, enabled: boolean) => invoke<OpencodeStatus>("desktop_import_opencode", { workspace, enabled }),
   control: (request: Record<string, unknown>) => invoke<ControlResult>("desktop_control", { request }),
   activity: (agentId: string) => invoke<string>("desktop_activity", { agentId }),
   activityTail: (agentId: string) => invoke<string>("desktop_activity_tail", { agentId, maxBytes: 16384 }),

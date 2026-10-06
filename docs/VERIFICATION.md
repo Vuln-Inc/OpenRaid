@@ -1,5 +1,58 @@
 # Verification record
 
+## v1.2.1 — Complete session reopening and explicit OpenCode import
+
+Coordinated Windows verification passed on **2026-10-07**, using Rust **1.96.0**:
+
+| Check | Result |
+| --- | --- |
+| `cargo test --locked -j 2 --all-targets -- --include-ignored` | **401 passed, 0 failed, 0 ignored**: 251 unit and 150 integration |
+| Final recovery-guard rerun: `cargo test --locked -j 2 --test session_controls --test session_restoration --test desktop -- --include-ignored` | **28 passed, 0 failed** on final runtime source |
+| Root warnings-denied all-target Clippy and formatting | Passed on final source |
+| Native desktop host tests | **7 passed, 0 failed** |
+| Native desktop warnings-denied all-target Clippy and formatting | Passed |
+| `npm test --prefix desktop` | **90 passed, 0 failed** |
+| `npm run build --prefix desktop` | TypeScript and production frontend build passed |
+| `npm test --prefix scripts` | **25 passed, 0 failed** |
+| `python scripts/test-package-release.py` | **9 passed**, including executable/license allowlist and attribution |
+| `python scripts/package-release.py --verify-tag v1.2.1` | Root, desktop host, frontend and Tauri versions match |
+| `actionlint -shellcheck= .github/workflows/release.yml` | Passed with actionlint 1.7.12; shellcheck not run |
+| `git diff --check` | Passed |
+
+Final release preparation reran the complete root suite with version **1.2.1**:
+**401 passed, 0 failed, 0 ignored**, including the recovery guard. The desktop
+host passed **7 tests**, frontend **90 tests**, SDK/provider suite **25 tests**,
+and packaging **9 tests**. Root and desktop warnings-denied Clippy and formatting,
+the production frontend build, and synchronized release versions also passed.
+
+The final broad gate includes real native-terminal startup consent checks,
+remembered reopen/resume, Node-backed provider/MCP fixtures, Windows ConPTY,
+and 50/100/500-agent runs followed by an eight-agent fresh run. A final review
+guard prevents queued owner steering from replacing the selected recovery task;
+the affected session, restoration, and desktop suites were rerun afterward.
+
+- **#27 and #29:** The objective is recovered independently of the visible board
+  page. Full agent transcripts and bounded usage metadata survive shutdown in
+  a per-database `.activity` directory. Checkpoints save per-agent telemetry;
+  legacy sessions hydrate available model history. Idle reopening dispatches no
+  requests, preserves pause state, and exposes explicit continuation in both
+  interfaces. Live HTTP coverage verifies saved tool-call/result history on
+  `/resume`; explicit startup `--resume` also clears a saved pause. Workspace
+  restoration excludes durable activity files.
+- **#28:** Existing OpenCode information requires a remembered opt-in before
+  automatic credentials or provider/MCP configuration are used. Tests cover
+  real startup acceptance/decline and remembered decisions, slash-menu import,
+  desktop confirmation and cancellation, stale availability responses, local
+  configuration precedence, and refreshing choices without restarting work.
+- **Release contents:** Packaging and publication permit only `openraid.exe`,
+  `openraid-desktop.exe`, and `LICENSE`. Icon attribution is included in the
+  license asset. Publication checks both staged and uploaded allowlists and
+  removes legacy assets when rerunning a release tag. Four-platform native
+  build/test jobs remain publication prerequisites.
+
+These checks establish local implementation behavior. Release publication and
+the four native CI build jobs are separate from this Windows verification.
+
 ## v1.2.0 — Optional desktop and combined releases
 
 Windows release preparation passed on **2026-10-05**, using Rust **1.90.0**:

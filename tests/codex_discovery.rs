@@ -100,6 +100,10 @@ fn codex_listing_fetches_live_models_without_refresh_flag() {
 #[test]
 fn codex_pool_imports_global_context_limits_and_project_overrides() {
     let directory = tempfile::tempdir().unwrap();
+    let mut auth =
+        openraid::auth::AuthStore::load_with_opencode(directory.path().join("auth.json"), None)
+            .unwrap();
+    auth.set_opencode_import_consent(true).unwrap();
     let config_directory = directory.path().join("opencode");
     std::fs::create_dir(&config_directory).unwrap();
     let (base_url, server) = serve_once(

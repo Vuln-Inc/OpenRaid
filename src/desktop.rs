@@ -55,6 +55,8 @@ pub struct DesktopAgent {
 pub struct DesktopSnapshot {
     pub session_id: Option<String>,
     pub state: DesktopState,
+    /// An unfinished saved task can be continued from an idle reopened window.
+    pub resumable: bool,
     pub workspace: PathBuf,
     pub database: PathBuf,
     pub model: String,
@@ -212,6 +214,7 @@ impl DesktopSession {
         Ok(DesktopSnapshot {
             session_id: self.session_id.lock().await.clone(),
             state,
+            resumable: self.store.unfinished_prompt().await?.is_some(),
             workspace: current.config.workspace.clone(),
             database: current.config.database.clone(),
             model: current.config.model.clone(),

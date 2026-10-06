@@ -54,6 +54,7 @@ pub struct SessionControl {
     pending_prompts: Arc<AtomicUsize>,
     interruptions: Arc<AtomicU64>,
     stop_pending: Arc<AtomicBool>,
+    recovery_requested: Arc<AtomicBool>,
     membership: watch::Sender<Arc<Membership>>,
     worker_stops: Arc<StdMutex<HashMap<String, watch::Sender<bool>>>>,
     workspace: Option<crate::workspace::WorkspaceTools>,
@@ -133,6 +134,7 @@ impl SessionControl {
             pending_prompts: Arc::new(AtomicUsize::new(0)),
             interruptions: Arc::new(AtomicU64::new(0)),
             stop_pending: Arc::new(AtomicBool::new(false)),
+            recovery_requested: Arc::new(AtomicBool::new(false)),
             membership,
             worker_stops: Arc::new(StdMutex::new(HashMap::new())),
             workspace: None,
@@ -141,6 +143,13 @@ impl SessionControl {
     pub fn with_membership(self, membership: Membership) -> Self {
         self.publish_membership(membership);
         self
+    }
+    pub fn with_paused(self, paused: bool) -> Self {
+        self.paused.send_replace(paused);
+        self
+    }
+    pub(crate) fn take_recovery_request(&self) -> bool {
+        self.recovery_requested.swap(false, Ordering::AcqRel)
     }
     pub fn members(&self) -> Vec<String> {
         self.membership.borrow().agent_ids.clone()
@@ -300,7 +309,12 @@ impl SessionControl {
         self.set_paused(true).await
     }
     pub async fn resume(&self) -> Result<()> {
-        self.set_paused(false).await
+        self.set_paused(false).await?;
+        if !self.is_busy() && self.store.unfinished_prompt().await?.is_some() {
+            self.recovery_requested.store(true, Ordering::Release);
+            self.notify_state();
+        }
+        Ok(())
     }
     async fn set_paused(&self, paused: bool) -> Result<()> {
         let _change = self.changes.lock().await;
@@ -315,12 +329,13 @@ impl SessionControl {
         let signal = self.paused.clone();
         let state = self.state_changes.clone();
         if !self.store.has_started().await? {
+            self.store.set_paused(paused).await?;
             signal.send_replace(paused);
             self.notify_state();
             return Ok(());
         }
         self.store
-            .owner_action(
+            .owner_action_with_pause(
                 "owner-control",
                 if paused {
                     "Owner paused work. Finish admitted request/tool groups, then wait for resume."
@@ -329,6 +344,7 @@ impl SessionControl {
                 }
                 .into(),
                 self.round.subscribe(),
+                Some(paused),
                 move || {
                     signal.send_replace(paused);
                     state.send_modify(|revision| *revision = revision.wrapping_add(1));

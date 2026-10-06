@@ -1,10 +1,12 @@
 //! Shared telemetry uses expandable per-agent slots, bounded previews, and disk-spooled activity.
 //! The global board is deliberately not stored here: SQLite remains its durable source.
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Take, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Mutex, RwLock,
@@ -25,6 +27,7 @@ struct ActivityLog {
     fallback: String,
     unavailable: bool,
     response_boundary_needed: bool,
+    durable: bool,
 }
 
 impl ActivityLog {
@@ -38,16 +41,20 @@ impl ActivityLog {
                 .unwrap_or_default()
                 .as_nanos();
             let number = NEXT_ACTIVITY_LOG.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "openraid-activity-{}-{stamp}-{number}.log",
-                std::process::id()
-            ));
-            match OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            let path = self.path.clone().unwrap_or_else(|| {
+                std::env::temp_dir().join(format!(
+                    "openraid-activity-{}-{stamp}-{number}.log",
+                    std::process::id()
+                ))
+            });
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            if self.durable {
+                options.create(true);
+            } else {
+                options.create_new(true);
+            }
+            match options.open(&path) {
                 Ok(file) => {
                     self.file = Some(file);
                     self.path = Some(path);
@@ -71,12 +78,16 @@ impl ActivityLog {
     fn snapshot(&self) -> ActivitySnapshot {
         // Freeze the complete byte length while holding the writer lock. A separate
         // handle then reads outside that lock without sharing the append cursor.
-        let reader = self.path.as_ref().map(|path| {
-            File::open(path).and_then(|file| {
-                let size = file.metadata()?.len();
-                Ok(file.take(size))
-            })
-        });
+        let reader = self
+            .path
+            .as_ref()
+            .filter(|path| path.is_file())
+            .map(|path| {
+                File::open(path).and_then(|file| {
+                    let size = file.metadata()?.len();
+                    Ok(file.take(size))
+                })
+            });
         let mut suffix = String::new();
         let reader = match reader {
             Some(Ok(reader)) => Some(reader),
@@ -153,13 +164,15 @@ impl Drop for ActivityLog {
     fn drop(&mut self) {
         // Close before unlinking: Windows does not permit removal of an open file.
         self.file.take();
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+        if !self.durable {
+            if let Some(path) = self.path.take() {
+                let _ = fs::remove_file(path);
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum AgentStatus {
     #[default]
@@ -243,6 +256,91 @@ pub struct Metrics {
     slots: RwLock<BTreeMap<String, Arc<AgentSlot>>>,
     started: Instant,
     changes: tokio::sync::watch::Sender<u64>,
+    directory: Option<PathBuf>,
+    persistence: Mutex<()>,
+    previous_elapsed_secs: f64,
+}
+
+/// Kept next to the database so custom session paths remain isolated.
+pub fn activity_directory(database: &Path) -> PathBuf {
+    let mut path = database.as_os_str().to_owned();
+    path.push(".activity");
+    PathBuf::from(path)
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedMetrics {
+    elapsed_secs: f64,
+    agents: BTreeMap<String, SavedAgent>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct SavedAgent {
+    status: AgentStatus,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    tools: u64,
+    retries: u64,
+    stream: String,
+    detail: String,
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    !id.is_empty()
+        && id != "metrics"
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn saved_agent(slot: &AgentSlot) -> SavedAgent {
+    SavedAgent {
+        status: AgentStatus::from_byte(slot.status.load(Ordering::Relaxed)),
+        input_tokens: slot.input_tokens.load(Ordering::Relaxed),
+        output_tokens: slot.output_tokens.load(Ordering::Relaxed),
+        cached_tokens: slot.cached_tokens.load(Ordering::Relaxed),
+        tools: slot.tools.load(Ordering::Relaxed),
+        retries: slot.retries.load(Ordering::Relaxed),
+        stream: slot
+            .stream
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        detail: slot
+            .detail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    }
+}
+
+fn save_json(directory: &Path, name: &str, value: &impl Serialize) -> Result<()> {
+    let number = NEXT_ACTIVITY_LOG.fetch_add(1, Ordering::Relaxed);
+    let temporary = directory.join(format!("state-{}-{number}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec(value)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, directory.join(name))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.context("saving session metrics")
+}
+
+impl Drop for Metrics {
+    fn drop(&mut self) {
+        let _ = self.persist();
+    }
 }
 
 impl Metrics {
@@ -275,10 +373,113 @@ impl Metrics {
             ),
             started: Instant::now(),
             changes: tokio::sync::watch::channel(0).0,
+            directory: None,
+            persistence: Mutex::new(()),
+            previous_elapsed_secs: 0.0,
         }
     }
 
+    /// Restore bounded dashboard state without loading full activity into memory.
+    /// Complete inspector history stays in append-only, per-session log files.
+    pub fn persistent(database: &Path) -> Result<Self> {
+        let directory = activity_directory(database);
+        fs::create_dir_all(&directory).context("creating session activity directory")?;
+        let state_path = directory.join("metrics.json");
+        let mut saved: SavedMetrics = if state_path.is_file() {
+            serde_json::from_slice(&fs::read(&state_path)?)
+                .context("reading saved session metrics")?
+        } else {
+            SavedMetrics::default()
+        };
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                if let Some(id) = path.file_stem().and_then(|id| id.to_str()) {
+                    if id != "metrics" && valid_agent_id(id) {
+                        saved.agents.insert(
+                            id.to_owned(),
+                            serde_json::from_slice(&fs::read(&path)?)
+                                .context("reading saved agent metrics")?,
+                        );
+                    }
+                }
+            }
+        }
+        let mut metrics = Self::new(0);
+        metrics.directory = Some(directory.clone());
+        metrics.previous_elapsed_secs = saved.elapsed_secs;
+        for (id, saved) in saved.agents {
+            if !valid_agent_id(&id) {
+                continue;
+            }
+            metrics.add_agent(&id);
+            let slot = metrics.slot(&id).expect("restored agent slot");
+            slot.status.store(saved.status as u8, Ordering::Relaxed);
+            slot.input_tokens
+                .store(saved.input_tokens, Ordering::Relaxed);
+            slot.output_tokens
+                .store(saved.output_tokens, Ordering::Relaxed);
+            slot.cached_tokens
+                .store(saved.cached_tokens, Ordering::Relaxed);
+            slot.tools.store(saved.tools, Ordering::Relaxed);
+            slot.retries.store(saved.retries, Ordering::Relaxed);
+            *slot.stream.lock().unwrap_or_else(|e| e.into_inner()) =
+                tail(&saved.stream, STREAM_PREVIEW_BYTES).to_owned();
+            *slot.detail.lock().unwrap_or_else(|e| e.into_inner()) =
+                tail(&saved.detail, DETAIL_BYTES).to_owned();
+        }
+        // Logs are written before telemetry snapshots. Recover inspector history
+        // even if the previous process exited before its first metrics snapshot.
+        for entry in fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|extension| extension == "log") {
+                if let Some(id) = path.file_stem().and_then(|id| id.to_str()) {
+                    metrics.add_agent(id);
+                }
+            }
+        }
+        Ok(metrics)
+    }
+
+    /// Checkpoint small dashboard state at safe runtime boundaries, rather than
+    /// rewriting it for every streamed token or PTY output fragment.
+    pub fn persist(&self) -> Result<()> {
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
+        let _guard = self.persistence.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = SavedMetrics {
+            elapsed_secs: self.previous_elapsed_secs + self.started.elapsed().as_secs_f64(),
+            ..SavedMetrics::default()
+        };
+        let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        for (id, slot) in slots.iter() {
+            save_json(directory, &format!("{id}.json"), &saved_agent(slot))?;
+        }
+        drop(slots);
+        save_json(directory, "metrics.json", &saved)
+    }
+
+    /// A worker checkpoint only writes that agent's bounded state, so checkpoint
+    /// I/O does not scale with the number of peers in the swarm.
+    pub fn persist_agent(&self, agent_id: &str) -> Result<()> {
+        let Some(directory) = &self.directory else {
+            return Ok(());
+        };
+        let Some(slot) = self.slot(agent_id) else {
+            return Ok(());
+        };
+        let _guard = self.persistence.lock().unwrap_or_else(|e| e.into_inner());
+        save_json(directory, &format!("{agent_id}.json"), &saved_agent(&slot))
+    }
+
     pub fn add_agent(&self, agent_id: &str) -> bool {
+        if self.directory.is_some() && !valid_agent_id(agent_id) {
+            return false;
+        }
         match self
             .slots
             .write()
@@ -286,12 +487,32 @@ impl Metrics {
             .entry(agent_id.to_owned())
         {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::new(AgentSlot::default()));
+                let slot = AgentSlot::default();
+                if let Some(directory) = &self.directory {
+                    let mut activity = slot.activity.lock().unwrap_or_else(|e| e.into_inner());
+                    let path = directory.join(format!("{agent_id}.log"));
+                    activity.response_boundary_needed = path.is_file();
+                    activity.path = Some(path);
+                    activity.durable = true;
+                }
+                entry.insert(Arc::new(slot));
                 self.changed();
                 true
             }
             std::collections::btree_map::Entry::Occupied(_) => false,
         }
+    }
+
+    /// A fresh launch can use a smaller roster than the previous run. Exclude
+    /// archived slots from live totals without deleting their saved activity.
+    pub fn retain_agents(&self, agent_ids: &[String]) {
+        let mut slots = self
+            .slots
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        slots.retain(|id, _| agent_ids.contains(id));
+        drop(slots);
+        self.changed();
     }
 
     fn slot(&self, agent_id: &str) -> Option<Arc<AgentSlot>> {
@@ -469,7 +690,7 @@ impl Metrics {
         let slots = self.slots.read().unwrap_or_else(|error| error.into_inner());
         let mut result = MetricsSnapshot {
             agents: Vec::with_capacity(slots.len()),
-            elapsed_secs: self.started.elapsed().as_secs_f64(),
+            elapsed_secs: self.previous_elapsed_secs + self.started.elapsed().as_secs_f64(),
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,

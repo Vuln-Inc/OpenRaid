@@ -114,15 +114,56 @@ impl Harness {
         let membership = store
             .initialize_membership(config.agents, retain_membership)
             .await?;
+        let paused = if retain_membership && !config.resume {
+            store.paused().await?
+        } else {
+            store.set_paused(false).await?;
+            false
+        };
         let initial_board_seq = store.latest_seq().await?;
-        let metrics = Arc::new(Metrics::new(0));
+        let metrics = Arc::new(Metrics::persistent(&config.database)?);
+        if !retain_membership {
+            metrics.retain_agents(&membership.agent_ids);
+        }
         for id in &membership.agent_ids {
             metrics.add_agent(id);
+            if metrics.agent_activity_tail(id, 1).is_empty() {
+                if let Some(checkpoint) = store.load_checkpoint(id).await? {
+                    if let Some(messages) = checkpoint.get("messages").and_then(Value::as_array) {
+                        for message in messages {
+                            let role = message
+                                .get("role")
+                                .and_then(Value::as_str)
+                                .unwrap_or("message");
+                            let content = message
+                                .get("content")
+                                .map(|value| {
+                                    value
+                                        .as_str()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| value.to_string())
+                                })
+                                .unwrap_or_default();
+                            metrics.append_activity(id, &format!("\n\n[{role}]\n{content}\n"));
+                            if let Some(calls) = message.get("tool_calls") {
+                                metrics.append_activity(id, &format!("[tool calls]\n{calls}\n"));
+                            }
+                        }
+                    }
+                }
+            }
         }
         if config.interactive_session && config.objective.trim().is_empty() {
             for id in &membership.agent_ids {
                 metrics.set_status(id, AgentStatus::Waiting);
-                metrics.set_detail(id, "idle · send a prompt to begin");
+                metrics.set_detail(
+                    id,
+                    if paused {
+                        "paused · resume to continue"
+                    } else {
+                        "idle · send a prompt to begin"
+                    },
+                );
             }
         }
         let workspace = WorkspaceTools::new(&config.workspace, config.max_processes)?;
@@ -142,7 +183,8 @@ impl Harness {
         )
         .with_mcp(mcp)
         .with_workspace(workspace)
-        .with_membership(membership);
+        .with_membership(membership)
+        .with_paused(paused);
         Ok(Self {
             store,
             metrics,
@@ -167,11 +209,13 @@ impl Harness {
                 .await
                 .map(|(summary, _)| summary);
             self.control.set_busy(false);
+            self.metrics.persist()?;
             self.control.mcp.shutdown().await;
             return result;
         }
         let mut stop = self.control.stop_receiver();
         let mut changes = self.store.subscribe_board();
+        let mut state_changes = self.control.state_receiver();
         // Controls become available when construction finishes. Prompts posted
         // before this future is first polled must still start a round, while
         // historical prompts from before this session stay audit-only.
@@ -186,6 +230,7 @@ impl Harness {
                 .then(|| (self.config.objective.clone(), 0, true))
         };
         let mut rounds = 0;
+        let mut recover_next = self.config.resume;
         let mut last = RunSummary {
             agents: self.control.members().len(),
             finished_agents: 0,
@@ -227,11 +272,21 @@ impl Harness {
                 }
             }
             if pending.is_none() {
-                for message in self.store.read_board(cursor, BOARD_PAGE).await? {
-                    cursor = message.seq;
-                    if message.owner && message.sender == "owner" {
-                        pending = Some((message.body, message.seq, false));
-                        break;
+                if self.control.take_recovery_request() {
+                    pending = self
+                        .store
+                        .unfinished_prompt()
+                        .await?
+                        .map(|prompt| (prompt.body, prompt.seq, false));
+                    recover_next = pending.is_some();
+                }
+                if pending.is_none() {
+                    for message in self.store.read_board(cursor, BOARD_PAGE).await? {
+                        cursor = message.seq;
+                        if message.owner && message.sender == "owner" {
+                            pending = Some((message.body, message.seq, false));
+                            break;
+                        }
                     }
                 }
             }
@@ -245,7 +300,8 @@ impl Harness {
                 }
                 let mut config = (*self.control.current().config).clone();
                 config.objective = objective;
-                config.resume = rounds == 0 && self.config.resume;
+                config.resume = recover_next || (rounds == 0 && self.config.resume);
+                recover_next = false;
                 let result = self.run_round(Arc::new(config), post, seq).await;
                 self.shutdown.send_replace(false);
                 self.control.set_busy(false);
@@ -272,11 +328,13 @@ impl Harness {
                     }
                 }
                 rounds += 1;
+                self.metrics.persist()?;
                 continue;
             }
             tokio::select! {
                 _ = stop.changed() => {},
                 _ = changes.changed() => {},
+                _ = state_changes.changed() => {},
                 _ = tokio::time::sleep(Duration::from_millis(250)) => { self.store.refresh_board().await?; },
             }
         }
@@ -285,6 +343,7 @@ impl Harness {
             .publish_membership(self.store.membership().await?);
         last.agents = self.control.members().len();
         self.control.mcp.shutdown().await;
+        self.metrics.persist()?;
         Ok(last)
     }
 
@@ -1179,7 +1238,8 @@ async fn save_context(
                 messages: context.borrowed_messages(),
             },
         )
-        .await
+        .await?;
+    shared.metrics.persist_agent(id)
 }
 
 fn context_config(config: &Config) -> ContextConfig {

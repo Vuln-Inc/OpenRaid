@@ -94,6 +94,7 @@ pub async fn capture(root: &Path, database: &Path) -> Result<String> {
             for suffix in ["", "-wal", "-shm"] {
                 exclusions.push(format!(":(exclude,literal){path}{suffix}"));
             }
+            exclusions.push(format!(":(exclude,literal){path}.activity"));
         }
         git(
             root,

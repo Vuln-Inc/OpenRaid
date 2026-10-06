@@ -90,7 +90,49 @@ impl ProviderManager {
         }
     }
     fn auth(&self) -> Result<AuthStore> {
-        AuthStore::load_with_opencode(self.auth_path.clone(), self.import_path.clone())
+        if self.import_path.is_some() {
+            AuthStore::load_with_opencode(self.auth_path.clone(), self.import_path.clone())
+        } else {
+            AuthStore::load(self.auth_path.clone())
+        }
+    }
+    pub fn import_opencode(&self) -> Result<()> {
+        let mut auth = self.auth()?;
+        let current = self.control.current();
+        ensure!(
+            auth.opencode_import_available()
+                || !Catalog::opencode_config_paths(&current.config.workspace).is_empty(),
+            "No existing OpenCode authentication or provider configuration was found"
+        );
+        // Parse the configuration before saving consent, so a malformed import
+        // leaves the user's previous choice intact.
+        let mut imported = Catalog::load_with_opencode(
+            &current.config.workspace,
+            current.config.config_path.as_deref(),
+            true,
+        )?;
+        for provider in imported.providers.values_mut() {
+            if let Some(endpoint) = auth.connection_endpoint(&provider.id) {
+                provider.api = endpoint.to_owned();
+                for model in provider.models.values_mut() {
+                    model.api = endpoint.to_owned();
+                }
+            }
+        }
+        auth.set_opencode_import_consent(true)?;
+        let mut catalog = self.catalog.lock().unwrap_or_else(|e| e.into_inner());
+        for (id, mut provider) in imported.providers {
+            if let Some(existing) = catalog.provider(&id) {
+                for (model_id, model) in &existing.models {
+                    provider
+                        .models
+                        .entry(model_id.clone())
+                        .or_insert_with(|| model.clone());
+                }
+            }
+            catalog.providers.insert(id, provider);
+        }
+        Ok(())
     }
     fn connected(&self, provider: &crate::catalog::ProviderInfo, auth: &AuthStore) -> bool {
         let active = self.control.current();

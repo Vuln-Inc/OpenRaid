@@ -10,6 +10,13 @@ cargo run --release -- setup
 
 The launcher lets you search providers, select a model, and choose that model's thinking variant before starting the swarm. Typing filters the current list; use the arrow keys to select and `Enter` to continue. `Esc` returns to the previous step, `Ctrl+U` clears the current search or input, and `Ctrl+C` cancels setup. API-key entry is masked. In multiline objective input, `Shift+Enter` or `Ctrl+J` inserts a newline.
 
+If OpenRaid detects existing OpenCode credentials or configuration on the first
+interactive launch, it asks before using them. **Keep OpenRaid separate** is the
+default, and the decision is remembered. `/import-opencode` opens a confirmation
+in the live console so you can enable import later. Until enabled, automatic
+OpenCode credential and configuration discovery stays disabled; explicit
+`--config` selections and OpenRaid's own configuration still work.
+
 Standard providers use their catalog or configured endpoints automatically: choose a provider, model, and variant, then connect with your key or supported account. You do not need to type an API URL. Explicit `--base-url` and configuration overrides still apply. Endpoint entry is reserved for `codex-lb` and a custom provider with no configured endpoint.
 
 The launch review shows the connection, model, thinking choice, output reserve, objective, and agent count. You can edit the objective or agent count there; agents start only after you choose **Launch swarm**.
@@ -46,6 +53,7 @@ Press `/` for the searchable command menu, or use these controls while the dashb
 | --- | --- | --- |
 | `/models` | `Ctrl+X`, then `m`; `F2` | Search tool-capable models across connected providers and switch the active selection |
 | `/connect` | `Ctrl+X`, then `c`; `F3` | Connect a catalog provider with a masked API-key prompt; Codex LB also prompts for its endpoint |
+| `/import-opencode` | Slash menu | Confirm reuse of OpenCode credentials and provider/model configuration |
 | `/variant` | `Ctrl+X`, then `t`; `F4` | Choose thinking depth for the current model; `Ctrl+T` cycles choices |
 | `/mcp` | Slash menu | Inspect configured MCP servers; enable, disable, or retry a connection |
 | `/jump` | `Ctrl+X`, then `j`; `F5` | Search sent prompts and jump to their board position |
@@ -93,7 +101,7 @@ cargo run --release -- auth list
 cargo run --release -- auth disconnect anthropic
 ```
 
-Disconnecting removes the OpenRaid-saved key. Environment credentials and the OpenCode fallback remain usable if present.
+Disconnecting removes the OpenRaid-saved key. Environment credentials remain usable if present; OpenCode fallback credentials remain usable when import consent is enabled.
 
 ### Custom endpoints and request options
 
@@ -109,9 +117,9 @@ Use `OPENRAID_API_KEY` for an explicit key override, or save a key with `auth co
 
 ### Custom provider configuration
 
-OpenRaid first imports provider definitions from `opencode/opencode.json` and `opencode/opencode.jsonc` under `XDG_CONFIG_HOME`, or `~/.config` when it is unset (`USERPROFILE` is supported on Windows). It reads the `provider` section and supported MCP settings without modifying those files or copying credentials into the repository.
+With OpenCode import enabled, OpenRaid first imports provider definitions from `opencode/opencode.json` and `opencode/opencode.jsonc` under `XDG_CONFIG_HOME`, or `~/.config` when it is unset (`USERPROFILE` is supported on Windows). It reads the `provider` section and supported MCP settings without modifying those files or copying credentials into the repository.
 
-`run` and `setup` accept `--config path/to/providers.jsonc`. Without an explicit file, OpenRaid checks the selected workspace for `openraid.json`, `openraid.jsonc`, `opencode.json`, then `opencode.jsonc`, using the first file present. Workspace or explicit provider settings override global settings. The explicit file remains available to live model menus and remembered launches. Provider definitions use OpenCode's `provider` shape; importing them does not import its plugins or unrelated application settings.
+`run` and `setup` accept `--config path/to/providers.jsonc`; explicitly selected files are always loaded. With import enabled, workspace `opencode.json` and `opencode.jsonc` settings are merged after global OpenCode settings. OpenRaid then applies the explicit file, or the first existing workspace file from `openraid.json` and `openraid.jsonc`, as the final override. The explicit file remains available to live model menus and remembered launches. Provider definitions use OpenCode's `provider` shape; importing them does not import its plugins or unrelated application settings.
 
 For example, save this as `openraid.json` and replace the endpoint and wire model ID with your server's values:
 
@@ -188,13 +196,13 @@ API-key resolution uses this order:
 2. A configured provider `options.apiKey` value.
 3. The selected provider's authentication environment variables.
 4. An API key saved in OpenRaid.
-5. An API-key entry in OpenCode's `auth.json`.
+5. An API-key entry in OpenCode's `auth.json`, after import consent.
 
 Cloud project IDs, regions, credential-file paths, and AWS signing-chain variables configure their SDK credential chains; they are not treated as bearer API keys.
 
 OpenRaid stores credentials, connected endpoint overrides, the last provider/model/variant selection, and launch preferences in `openraid/auth.json` under `XDG_DATA_HOME`, or under `~/.local/share` when `XDG_DATA_HOME` is unset. The previous objective and session-only API-key field are not saved in the launch profile. On Windows, the home fallback uses `USERPROFILE` if `HOME` is unavailable. Set `OPENRAID_AUTH_FILE` to use a different OpenRaid credentials file.
 
-The OpenCode fallback is read from `opencode/auth.json` under the same data directory. Imported OAuth entries are distinguished from API keys. An environment or OpenRaid API key for the same provider takes precedence over that fallback.
+After consent, the OpenCode fallback is read from `opencode/auth.json` under the same data directory. The saved import decision controls both credential fallback and automatic OpenCode configuration discovery. Imported OAuth entries are distinguished from API keys. An environment or OpenRaid API key for the same provider takes precedence over that fallback.
 
 Saving a selection remembers its identifiers; it does not establish access to a model. Model access remains controlled by the provider or proxy.
 
@@ -210,7 +218,7 @@ cargo run --release -- auth login github-copilot-enterprise --enterprise-url com
 
 The command displays a verification URL and code. Open that URL in your browser, approve the account connection, and leave OpenRaid running until login completes. `Ctrl+C` cancels the wait. The guided launcher offers the same account-sign-in choice during connection setup.
 
-Existing OpenCode OAuth accounts can also be reused through the auth-file fallback without another login. For Codex account authentication, OpenRaid uses the Codex Responses endpoint and account-routing metadata. Copilot selects its protocol by model family, including native Anthropic Messages for Claude models.
+With import consent, existing OpenCode OAuth accounts can also be reused through the auth-file fallback without another login. For Codex account authentication, OpenRaid uses the Codex Responses endpoint and account-routing metadata. Copilot selects its protocol by model family, including native Anthropic Messages for Claude models.
 
 Codex access tokens are refreshed before provider requests when needed. Agents share the refresh lock, and refreshed credentials are saved in the OpenRaid credentials file without rewriting OpenCode's original file. Run `auth login openai` again if the account is revoked or its refresh token is no longer valid; Copilot accounts can similarly reconnect with their `auth login` command.
 

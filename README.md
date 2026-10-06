@@ -7,10 +7,10 @@
 **A collaborative agent swarm. One native runtime. One shared board.**
 
 [![Rust](https://img.shields.io/badge/runtime-Rust%20%2F%20Tokio-a8b8ff?style=flat-square&labelColor=152638)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-1.2.0-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.2.0)
+[![Version](https://img.shields.io/badge/version-1.2.1-79c9bb?style=flat-square&labelColor=152638)](https://github.com/Vuln-Inc/openraid/releases/tag/v1.2.1)
 [![Workers](https://img.shields.io/badge/workers-1%E2%80%93500-79c9bb?style=flat-square&labelColor=152638)](#add-and-remove-agents)
 [![Terminals](https://img.shields.io/badge/terminals-ConPTY%20%2B%20Unix%20PTY-79c9bb?style=flat-square&labelColor=152638)](#native-tools-and-persistent-terminals)
-[![Verification](https://img.shields.io/badge/verified-354%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
+[![Verification](https://img.shields.io/badge/verified-401%20Rust%20tests-a8b8ff?style=flat-square&labelColor=152638)](docs/VERIFICATION.md)
 
 [**Quick start**](#install-and-launch) · [**Desktop app**](#optional-desktop-app) · [**Providers**](docs/PROVIDERS.md) · [**Console controls**](#use-the-interactive-console) · [**Verification**](docs/VERIFICATION.md)
 
@@ -139,16 +139,15 @@ Build-only scripts are `build_win.bat` and `build_linux.sh`; the Bash build scri
 
 ### Use a standalone executable
 
-Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for published platform builds. A standalone native executable does not need Cargo. Invoke it directly:
+Check [GitHub Releases](https://github.com/Vuln-Inc/openraid/releases) for standalone Windows executables. A standalone native executable does not need Cargo. Release automation publishes only these assets:
 
-| Platform | v1.2.0 archive |
+| Asset | Purpose |
 | --- | --- |
-| Linux x86-64 | `openraid-v1.2.0-linux-x86_64.tar.gz` |
-| Windows x86-64 | `openraid-v1.2.0-windows-x86_64.zip` |
-| macOS Intel | `openraid-v1.2.0-darwin-x86_64.tar.gz` |
-| macOS Apple Silicon | `openraid-v1.2.0-darwin-arm64.tar.gz` |
+| `openraid.exe` | Windows x86-64 terminal interface |
+| `openraid-desktop.exe` | Windows x86-64 desktop interface |
+| `LICENSE` | Project license and embedded desktop icon attribution |
 
-Extract the matching archive and check its checksum against `SHA256SUMS` from the same release. The release workflow packages both the TUI (`openraid`) and desktop (`openraid-desktop`) executables, documentation, and optional SDK runtime companions in each platform archive. Windows binaries use the `.exe` extension. Launch the desktop executable without CLI arguments; see [desktop requirements](docs/DESKTOP.md#requirements) for WebView prerequisites. Previously published archives are not changed until the workflow is run for a release tag.
+Download the executable you want and `LICENSE` into the same directory, then invoke it directly. Launch the desktop executable without CLI arguments; see [desktop requirements](docs/DESKTOP.md#requirements) for WebView prerequisites. Linux and macOS builds remain verified by CI and can be built from source. Rerunning the workflow for an existing release tag replaces its archive/checksum assets with this executable-only layout.
 
 ```powershell
 .\openraid.exe setup --workspace "C:\Projects\my-app" --agents 4
@@ -158,7 +157,7 @@ Extract the matching archive and check its checksum against `SHA256SUMS` from th
 ./openraid setup --workspace "$HOME/projects/my-app" --agents 4
 ```
 
-For specialized providers, install the SDK sidecar dependencies and keep its companion files together; see [the provider deployment guide](docs/PROVIDERS.md#native-transports-and-the-sdk-bridge).
+Native provider transports work with the standalone executable. For specialized providers, obtain the SDK sidecar from the source checkout and install its dependencies; see [the provider deployment guide](docs/PROVIDERS.md#native-transports-and-the-sdk-bridge).
 
 ### Try the offline demo first
 
@@ -222,7 +221,7 @@ For frontend/desktop development, use `npm run tauri --prefix desktop -- dev`. T
 
    > Implement pagination for the existing catalog endpoint. Read the current API and tests first, discuss the work on the shared board, preserve the public response format, and verify the implementation before voting done.
 
-After the task reaches consensus and drains, the guided console stays open for another prompt. Later `setup` launches reopen the most recently used session **in the current workspace** at an idle home, including sessions with unfinished work from an interruption or console close. Opening a saved session does not start agents. Use `/start your objective` to start work, `/new` for fresh history, or launch with `setup --resume` to explicitly continue an interrupted task with its durable roster and checkpoints. Explicitly stopped work stays stopped.
+After the task reaches consensus and drains, the guided console stays open for another prompt. Later `setup` launches reopen the most recently used session **in the current workspace** without starting agents, including sessions with unfinished work from an interruption or console close. The previous objective, pause state, agent activity, usage, roster, and checkpoints are restored. Use `/resume` to continue unfinished work, `/start your objective` to start new work, `/new` for fresh history, or launch with `setup --resume` to explicitly continue an interrupted task. Explicitly stopped work stays stopped.
 
 Use `run --select` when you want the full guided selection flow again. Explicit `run` and `demo` commands finish after their round drains.
 
@@ -325,7 +324,7 @@ cargo run --release --locked -- auth login openai
 cargo run --release --locked -- auth login github-copilot
 ```
 
-API credentials resolve from an explicit `--api-key` or `OPENRAID_API_KEY`, configured provider key, provider-specific environment variables, saved OpenRaid key, then OpenCode fallback credentials. Existing supported OpenCode OAuth accounts can also be reused. See [authentication details](docs/PROVIDERS.md#credentials-and-remembered-selections) for account-specific behavior and credential locations.
+API credentials resolve from an explicit `--api-key` or `OPENRAID_API_KEY`, configured provider key, provider-specific environment variables, saved OpenRaid key, then OpenCode fallback credentials when import is enabled. On first interactive launch, detected OpenCode credentials or configuration trigger a confirmation before they are used; keeping OpenRaid separate is the default. The choice is remembered. Use `/import-opencode` later to enable reuse of OpenCode credentials, providers, and models. Existing supported OpenCode OAuth accounts can also be reused after consent. See [authentication details](docs/PROVIDERS.md#credentials-and-remembered-selections) for account-specific behavior and credential locations.
 
 ### Thinking is model-specific
 
@@ -355,7 +354,7 @@ bash run.sh run 'Implement and verify the objective' \
   --base-url http://127.0.0.1:2455/v1 --protocol responses --agents 4
 ```
 
-Global OpenCode provider definitions are imported automatically, including an existing `codex-pool` entry. Explicit configured model limits survive discovery, but models absent from the server are not offered. See [the Codex LB guide](docs/PROVIDERS.md#codex-lb-v1240) for server setup and endpoint details.
+After import consent, global OpenCode provider definitions are available, including an existing `codex-pool` entry. Explicit configured model limits survive discovery, but models absent from the server are not offered. See [the Codex LB guide](docs/PROVIDERS.md#codex-lb-v1240) for server setup and endpoint details.
 
 ## Use the interactive console
 
@@ -369,11 +368,13 @@ An OpenCode-inspired transcript separates responses, tool calls, results, and st
 
 Use arrow keys or `j` / `k`, the mouse wheel, or `PageUp` / `PageDown` to browse activity. `Home` jumps to the beginning; `End` jumps to the latest output and resumes following. Press `f` to toggle following live output. `Esc` or `q` returns to the same dashboard or tiled view with the selected agent preserved.
 
-Full activity is spooled to temporary files during the running session, keeping
-dashboard previews bounded. These temporary activity files are removed when the
-runtime exits; the SQLite board/checkpoints and command/PTY disk logs remain
-separate. If temporary storage fails, the inspector explicitly reports its
-bounded recent-history fallback.
+Full activity is spooled to a durable directory beside each session database,
+named `<database filename>.activity`, keeping dashboard previews bounded.
+Closing and reopening the session restores inspector history and usage counters.
+Keep that directory with the SQLite database when moving or backing up a session.
+Older sessions recover available checkpoint history on first reopening; output
+that was previously discarded cannot be recreated. If activity storage fails,
+the inspector explicitly reports its bounded recent-history fallback.
 
 ### Commands
 
@@ -390,6 +391,7 @@ Press `/` to open the searchable command menu. Commands with arguments can also 
 | `/models` or `/model` | Choose a tool-capable model from connected providers |
 | `/models openai/gpt-4.1-mini` | Select an exact qualified provider/model ID |
 | `/connect` | Connect a provider; enter a custom endpoint when one is missing |
+| `/import-opencode` | Confirm reuse of detected OpenCode credentials and provider/model configuration |
 | `/variant` | Choose thinking depth for the current model |
 | `/variant default` | Remove the selected thinking override |
 | `/themes` or `/theme` | Browse the built-in terminal themes |
@@ -621,16 +623,14 @@ Implicit model budgets are recalculated on model selection and session reopening
 
 ### Provider and MCP files
 
-Global provider/MCP definitions are read from `opencode/opencode.json` and `opencode/opencode.jsonc` under `XDG_CONFIG_HOME`, or `~/.config` when it is unset. Windows home lookup supports `USERPROFILE`.
+After OpenCode import consent, global provider/MCP definitions are read from `opencode/opencode.json` and `opencode/opencode.jsonc` under `XDG_CONFIG_HOME`, or `~/.config` when it is unset. Windows home lookup supports `USERPROFILE`.
 
-Without `--config`, the workspace is checked for the first existing file in this order:
+With import enabled, workspace `opencode.json` and `opencode.jsonc` definitions
+are merged after the global OpenCode definitions. OpenRaid then applies an
+explicit `--config` file, or the first existing workspace file from
+`openraid.json` and `openraid.jsonc`, as the final override.
 
-1. `openraid.json`
-2. `openraid.jsonc`
-3. `opencode.json`
-4. `opencode.jsonc`
-
-Workspace/explicit definitions override global definitions. Supported strings can use `{env:VARIABLE_NAME}` or `{file:path/to/value.txt}` references. OpenCode provider configuration is imported; its unrelated plugins and application settings are not.
+Workspace/explicit definitions override global definitions. An explicit `--config` path is always loaded as an intentional selection. Supported strings can use `{env:VARIABLE_NAME}` or `{file:path/to/value.txt}` references. OpenCode provider configuration is imported after consent; its unrelated plugins and application settings are not.
 
 For a custom API:
 
@@ -660,15 +660,15 @@ Replace the example URL/IDs, connect with `auth connect my-api`, and select `my-
 
 ## Persistence, recovery, and prompt restoration
 
-The SQLite database stores the global board, prompts, active roster, votes, and worker checkpoints. Keep the database when you want to inspect history or continue interrupted work.
+The SQLite database stores the global board, prompts, active roster, votes, pause state, and worker checkpoints. Its adjacent `.activity` directory retains complete agent transcripts and usage metadata. Keep both when you want to inspect history or continue interrupted work. The objective header is restored from the latest task prompt, including completed tasks outside the visible board page.
 
 - An unexpected exit of an active worker restarts the **same logical identity** from its checkpoint and writes a recovery notice.
 - Removed workers remain retired. Workers finishing a committed consensus round do not restart.
 - `run … --resume` restores an interrupted durable session explicitly.
-- Interactive `setup` and session switching open saved history idle, even when work is unfinished. Use `/start` to submit an objective, `/new` for separate history, or `setup --resume` to explicitly continue interrupted work; completed and explicitly stopped prompts stay audit-only.
+- Interactive `setup` and session switching open saved history without dispatching work, preserving paused state. Use `/resume` to continue unfinished work, `/start` to submit a new objective, `/new` for separate history, or `setup --resume` to explicitly continue interrupted work; completed and explicitly stopped prompts stay audit-only.
 - Pending tool groups are repaired without blindly replaying a command whose result was not durably recorded.
 
-Credentials/preferences are stored in `openraid/auth.json` under `XDG_DATA_HOME`, or `~/.local/share` when unset. `OPENRAID_AUTH_FILE` overrides that file. Launch profiles remember each workspace/session's model and settings rather than storing the previous objective or a session-only API key. Session metadata is stored in a sibling `sessions/` directory. OpenCode fallback credentials are read from the corresponding `opencode/auth.json`.
+Credentials/preferences are stored in `openraid/auth.json` under `XDG_DATA_HOME`, or `~/.local/share` when unset. `OPENRAID_AUTH_FILE` overrides that file. Launch profiles remember each workspace/session's model and settings; the objective is recovered from the session database rather than the launch profile. Session-only API keys are not stored in launch profiles. Session metadata is stored in a sibling `sessions/` directory. With import consent, OpenCode fallback credentials are read from the corresponding `opencode/auth.json`.
 
 ### Restore a prompt
 
@@ -705,7 +705,9 @@ The recorded acceptance gate includes:
 
 | Check | Recorded result |
 | --- | --- |
-| Rust, including optional integration fixtures | **354 passed on Windows**, none failed or ignored |
+| Rust, including optional integration fixtures | **401 passed on Windows**, none failed or ignored; final recovery-guard suites also passed **28/28** |
+| Desktop frontend and native host | **90 frontend tests**, **7 native host tests**, TypeScript/production build passed |
+| Executable/license release packaging | **9 tests passed**; release workflow passed actionlint |
 | Node SDK/transport/discovery tests | **25 passed** |
 | Native PTY tests | **8 Windows ConPTY cases; 9 Unix cases** |
 | OpenCode source audit | **23 custom loaders and 24 upstream adapter entries** accounted for |
@@ -713,7 +715,7 @@ The recorded acceptance gate includes:
 | Formatting and Clippy | Passed; Clippy warning-free |
 | Windows and Linux build/run scripts | Passed from outside the checkout, including 500-agent full drain |
 
-These checks cover local protocol behavior, real OS terminals, durable state, parallel membership, safe draining, liveness, and worker recovery. Current regressions verify idle reopening of unfinished sessions, explicit recovery, remembered legacy-path correction, immediate roster removal, and responsive inspector rendering and selection. They do not benchmark model quality, paid-cloud account access, or 500-agent live-provider throughput. The verification record also includes earlier release-console walkthroughs for multiple prompt rounds, Unicode, custom connections, MCP status transitions, and completed-home no-replay.
+These checks cover local protocol behavior, real OS terminals, durable state, parallel membership, safe draining, liveness, and worker recovery. Current regressions verify restored objectives and complete agent history/usage, saved pause state, idle reopening and explicit continuation in both interfaces, first-launch OpenCode consent and later import, remembered legacy-path correction, immediate roster removal, and responsive inspector rendering and selection. They do not benchmark model quality, paid-cloud account access, or 500-agent live-provider throughput. The verification record also includes earlier release-console walkthroughs for multiple prompt rounds, Unicode, custom connections, MCP status transitions, and completed-home no-replay.
 
 Run the Rust checks:
 

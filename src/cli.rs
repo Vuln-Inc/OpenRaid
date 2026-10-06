@@ -181,7 +181,7 @@ impl RunArgs {
         self,
         mock: bool,
         force_setup: bool,
-        auth: AuthStore,
+        mut auth: AuthStore,
     ) -> Result<Option<Config>> {
         let requested_session = self
             .session
@@ -200,6 +200,37 @@ impl RunArgs {
         let workspace = tokio::fs::canonicalize(selected_workspace)
             .await
             .with_context(|| format!("opening workspace {}", selected_workspace.display()))?;
+        if !mock
+            && !self.no_tui
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && auth.opencode_import_consent().is_none()
+            && (auth.opencode_import_available()
+                || !Catalog::opencode_config_paths(&workspace).is_empty())
+        {
+            let mut ui = SetupUi::new()?;
+            let choices = [
+                Choice::new(
+                    "skip",
+                    "Keep OpenRaid separate",
+                    "You can import later with /import-opencode",
+                ),
+                Choice::new(
+                    "import",
+                    "Use existing OpenCode information",
+                    "Use saved API keys, OAuth accounts and provider configuration",
+                ),
+            ];
+            let Some(choice) = ui.pick(
+                "Existing OpenCode information found",
+                "Should OpenRaid use your OpenCode authentication and providers? Your choice is remembered.",
+                &choices,
+                Some("skip"),
+            )? else {
+                return Ok(None);
+            };
+            auth.set_opencode_import_consent(choice == "import")?;
+        }
         if let Some(entry) = &requested_session {
             if entry.workspace != workspace {
                 bail!(
@@ -876,52 +907,7 @@ pub fn load_catalog(
     workspace: &std::path::Path,
     explicit: Option<&std::path::Path>,
 ) -> Result<Catalog> {
-    let mut catalog = Catalog::bundled()?;
-    let config_root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| PathBuf::from(home).join(".config"))
-        });
-    let mut paths = Vec::new();
-    if let Some(root) = config_root {
-        for name in ["opencode.json", "opencode.jsonc"] {
-            let path = root.join("opencode").join(name);
-            if path.is_file() {
-                paths.push(path);
-            }
-        }
-    }
-    let path = explicit.map(PathBuf::from).or_else(|| {
-        [
-            "openraid.json",
-            "openraid.jsonc",
-            "opencode.json",
-            "opencode.jsonc",
-        ]
-        .iter()
-        .map(|name| workspace.join(name))
-        .find(|path| path.is_file())
-    });
-    if let Some(path) = path {
-        paths.retain(|existing| existing != &path);
-        paths.push(path);
-    }
-    for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading provider config {}", path.display()))?;
-        let value: Value = json5::from_str(&text)
-            .with_context(|| format!("invalid JSON/JSONC provider config {}", path.display()))?;
-        let providers =
-            json!({"provider":value.get("provider").cloned().unwrap_or_else(|| json!({}))});
-        let value = openraid::provider_settings::expand_config(
-            &providers,
-            path.parent().unwrap_or(workspace),
-        )?;
-        catalog.apply_config(&value)?;
-    }
-    Ok(catalog)
+    Catalog::load(workspace, explicit)
 }
 
 fn parse_protocol(value: &str) -> Result<Protocol> {

@@ -128,10 +128,15 @@ impl Store {
                           CREATE TABLE IF NOT EXISTS worker_slots (
                               agent_id TEXT PRIMARY KEY REFERENCES members(agent_id)
                           );
-                          CREATE TABLE IF NOT EXISTS membership_phase (
+                           CREATE TABLE IF NOT EXISTS membership_phase (
                               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                               draining INTEGER NOT NULL CHECK(draining IN (0, 1))
-                          );
+                           );
+                           CREATE TABLE IF NOT EXISTS session_state (
+                               singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                               paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1))
+                           );
+                           INSERT OR IGNORE INTO session_state(singleton,paused) VALUES (1,0);
                          INSERT OR IGNORE INTO prompts(seq, body, created_at_ms)
                          SELECT seq, body, created_at_ms FROM board WHERE owner = 1 AND sender = 'owner';",
                     )?;
@@ -309,6 +314,9 @@ impl Store {
         self.call(move |connection| {
             let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute("UPDATE membership_phase SET draining=1 WHERE singleton=1", [])?;
+            if body.starts_with("Owner stopped current work;") {
+                transaction.execute("UPDATE session_state SET paused=0 WHERE singleton=1", [])?;
+            }
             transaction.execute("DELETE FROM votes", [])?;
             transaction.execute(
                 "INSERT INTO board(sender,body,owner,created_at_ms) VALUES ('owner-control',?1,1,?2)",
@@ -490,12 +498,31 @@ impl Store {
         shutdown: watch::Receiver<bool>,
         publish: impl FnOnce() + Send + 'static,
     ) -> Result<BoardMessage> {
+        self.owner_action_with_pause(sender, body, shutdown, None, publish)
+            .await
+    }
+
+    /// Commit pause state and its audit notice together before publication.
+    pub async fn owner_action_with_pause(
+        &self,
+        sender: &str,
+        body: String,
+        shutdown: watch::Receiver<bool>,
+        paused: Option<bool>,
+        publish: impl FnOnce() + Send + 'static,
+    ) -> Result<BoardMessage> {
         let sender = sender.to_owned();
         let revision = self.revision.clone();
         self.call(move |connection| {
             ensure!(!*shutdown.borrow(), "the session has finished");
             let created_at_ms = timestamp_ms();
             let transaction = connection.transaction()?;
+            if let Some(paused) = paused {
+                transaction.execute(
+                    "UPDATE session_state SET paused=?1 WHERE singleton=1",
+                    [paused],
+                )?;
+            }
             transaction.execute(
                 "INSERT INTO board(sender, body, owner, created_at_ms) VALUES (?1, ?2, 1, ?3)",
                 params![sender, body, created_at_ms],
@@ -518,6 +545,50 @@ impl Store {
                 owner: true,
                 created_at_ms,
             })
+        })
+        .await
+    }
+
+    pub async fn paused(&self) -> Result<bool> {
+        self.call(|connection| {
+            Ok(connection.query_row(
+                "SELECT paused FROM session_state WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    pub async fn set_paused(&self, paused: bool) -> Result<()> {
+        self.call(move |connection| {
+            connection.execute(
+                "UPDATE session_state SET paused=?1 WHERE singleton=1",
+                [paused],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The latest task remains visible even after completion or an operator stop.
+    pub async fn latest_task_prompt(&self) -> Result<Option<BoardMessage>> {
+        self.call(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT seq,body,created_at_ms FROM prompts ORDER BY seq DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok(BoardMessage {
+                            seq: row.get(0)?,
+                            body: row.get(1)?,
+                            created_at_ms: row.get(2)?,
+                            sender: "owner".into(),
+                            owner: true,
+                        })
+                    },
+                )
+                .optional()?)
         })
         .await
     }

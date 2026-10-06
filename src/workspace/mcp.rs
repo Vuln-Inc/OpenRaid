@@ -114,32 +114,26 @@ impl ServerConfig {
 }
 
 pub fn load(workspace: &Path, explicit: Option<&Path>) -> Result<BTreeMap<String, ServerConfig>> {
-    let root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(|home| PathBuf::from(home).join(".config"))
-        });
-    let mut paths = Vec::new();
-    if let Some(root) = root {
-        for file in ["opencode.json", "opencode.jsonc"] {
-            let path = root.join("opencode").join(file);
-            if path.is_file() {
-                paths.push(path);
-            }
-        }
-    }
+    let import_opencode =
+        crate::auth::AuthStore::load_default()?.opencode_import_consent() == Some(true);
+    load_with_opencode(workspace, explicit, import_opencode)
+}
+
+pub fn load_with_opencode(
+    workspace: &Path,
+    explicit: Option<&Path>,
+    import_opencode: bool,
+) -> Result<BTreeMap<String, ServerConfig>> {
+    let mut paths = if import_opencode {
+        crate::catalog::Catalog::opencode_config_paths(workspace)
+    } else {
+        Vec::new()
+    };
     let local = explicit.map(PathBuf::from).or_else(|| {
-        [
-            "openraid.json",
-            "openraid.jsonc",
-            "opencode.json",
-            "opencode.jsonc",
-        ]
-        .iter()
-        .map(|file| workspace.join(file))
-        .find(|file| file.is_file())
+        ["openraid.json", "openraid.jsonc"]
+            .iter()
+            .map(|file| workspace.join(file))
+            .find(|file| file.is_file())
     });
     if let Some(path) = local {
         paths.retain(|old| old != &path);
@@ -1178,6 +1172,38 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_mcp_discovery_requires_consent_and_openraid_overrides_imports() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let opencode = directory.path().join("opencode.json");
+        std::fs::write(
+            &opencode,
+            r#"{"mcp":{"import-consent-fixture":{"type":"remote","url":"http://localhost/import","enabled":false},"import-override-fixture":{"type":"remote","url":"http://localhost/import","enabled":false}}}"#,
+        )?;
+        std::fs::write(
+            directory.path().join("openraid.json"),
+            r#"{"mcp":{"import-override-fixture":{"type":"remote","url":"http://localhost/openraid","enabled":false}}}"#,
+        )?;
+        let declined = load_with_opencode(directory.path(), None, false)?;
+        assert!(!declined.contains_key("import-consent-fixture"));
+        assert_eq!(
+            declined["import-override-fixture"].url,
+            "http://localhost/openraid"
+        );
+        let imported = load_with_opencode(directory.path(), None, true)?;
+        assert_eq!(
+            imported["import-consent-fixture"].url,
+            "http://localhost/import"
+        );
+        assert_eq!(
+            imported["import-override-fixture"].url,
+            "http://localhost/openraid"
+        );
+        let explicit = load_with_opencode(directory.path(), Some(&opencode), false)?;
+        assert!(explicit.contains_key("import-consent-fixture"));
+        Ok(())
+    }
     use std::sync::atomic::AtomicUsize;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},

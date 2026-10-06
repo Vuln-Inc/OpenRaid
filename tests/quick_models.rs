@@ -25,6 +25,60 @@ fn resolve(
 }
 
 #[tokio::test]
+async fn explicit_opencode_import_refreshes_live_menu_and_remembers_consent() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    std::fs::write(
+        directory.path().join("opencode.json"),
+        r#"{"provider":{"import-fixture":{"api":"http://localhost/v1","options":{"apiKey":"fixture-import-key"},"models":{"import-model":{"tool_call":true}}}}}"#,
+    )?;
+    let catalog = Catalog::load_with_opencode(directory.path(), None, false)?;
+    assert!(catalog.provider("import-fixture").is_none());
+    let auth_path = directory.path().join("auth.json");
+    let auth = AuthStore::load_with_opencode(&auth_path, None)?;
+    let harness = Harness::new(Config {
+        provider: "openai".into(),
+        model: "saved-custom-model".into(),
+        base_url: "http://localhost/v1".into(),
+        workspace: directory.path().to_owned(),
+        database: directory.path().join("import.sqlite3"),
+        mock: true,
+        interactive_session: true,
+        objective: String::new(),
+        agents: 1,
+        ..Config::default()
+    })
+    .await?;
+    let manager = ProviderManager::new(catalog, harness.control.clone(), resolve, &auth);
+    assert!(!manager
+        .providers()?
+        .iter()
+        .any(|entry| entry.id == "import-fixture"));
+    assert_eq!(auth.opencode_import_consent(), None);
+    manager.import_opencode()?;
+    assert_eq!(
+        AuthStore::load(&auth_path)?.opencode_import_consent(),
+        Some(true)
+    );
+    assert!(manager
+        .providers()?
+        .iter()
+        .any(|entry| entry.id == "import-fixture"));
+    assert!(manager
+        .models()
+        .await?
+        .iter()
+        .any(|entry| entry.id == "import-fixture/import-model"));
+    assert!(manager
+        .models()
+        .await?
+        .iter()
+        .any(|entry| entry.id == "openai/saved-custom-model"));
+    assert_eq!(harness.control.current().config.model, "saved-custom-model");
+    assert!(harness.control.current().config.objective.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn public_opencode_live_menu_only_exposes_free_models_until_connected() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let mut catalog = Catalog::from_json(

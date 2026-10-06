@@ -244,33 +244,28 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn load(workspace: &std::path::Path, explicit: Option<&std::path::Path>) -> Result<Self> {
+        let enabled =
+            crate::auth::AuthStore::load_default()?.opencode_import_consent() == Some(true);
+        Self::load_with_opencode(workspace, explicit, enabled)
+    }
+
+    /// Explicit paths remain user-selected configuration; automatic OpenCode
+    /// discovery requires consent. OpenRaid config is always loaded normally.
+    pub fn load_with_opencode(
+        workspace: &std::path::Path,
+        explicit: Option<&std::path::Path>,
+        enabled: bool,
+    ) -> Result<Self> {
         let mut catalog = Self::bundled()?;
-        let root = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(|home| std::path::PathBuf::from(home).join(".config"))
-            });
         let mut paths = Vec::new();
-        if let Some(root) = root {
-            for name in ["opencode.json", "opencode.jsonc"] {
-                let path = root.join("opencode").join(name);
-                if path.is_file() {
-                    paths.push(path);
-                }
-            }
+        if enabled {
+            paths.extend(Self::opencode_config_paths(workspace));
         }
         let local = explicit.map(std::path::PathBuf::from).or_else(|| {
-            [
-                "openraid.json",
-                "openraid.jsonc",
-                "opencode.json",
-                "opencode.jsonc",
-            ]
-            .iter()
-            .map(|name| workspace.join(name))
-            .find(|path| path.is_file())
+            ["openraid.json", "openraid.jsonc"]
+                .iter()
+                .map(|name| workspace.join(name))
+                .find(|path| path.is_file())
         });
         if let Some(path) = local {
             paths.retain(|old| old != &path);
@@ -291,6 +286,39 @@ impl Catalog {
             catalog.apply_config(&value)?;
         }
         Ok(catalog)
+    }
+
+    pub fn opencode_import_available(workspace: &std::path::Path) -> bool {
+        !Self::opencode_config_paths(workspace).is_empty()
+    }
+
+    pub fn opencode_config_paths(workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut paths = Self::global_opencode_paths();
+        paths.extend(
+            ["opencode.json", "opencode.jsonc"]
+                .iter()
+                .map(|name| workspace.join(name))
+                .filter(|path| path.is_file()),
+        );
+        paths
+    }
+
+    fn global_opencode_paths() -> Vec<std::path::PathBuf> {
+        let root = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(|home| std::path::PathBuf::from(home).join(".config"))
+            });
+        root.map(|root| {
+            ["opencode.json", "opencode.jsonc"]
+                .iter()
+                .map(|name| root.join("opencode").join(name))
+                .filter(|path| path.is_file())
+                .collect()
+        })
+        .unwrap_or_default()
     }
 
     pub fn bundled() -> Result<Self> {
@@ -927,6 +955,65 @@ fn search_score(query: &str, fields: &[&str]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_opencode_config_requires_consent_but_explicit_paths_are_loaded() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let imported = root.path().join("opencode.json");
+        std::fs::write(
+            &imported,
+            r#"{"provider":{"consent-fixture":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"https://fixture.invalid/v1","apiKey":"fixture-key"},"models":{"fixture-model":{}}}}}"#,
+        )?;
+        assert!(Catalog::opencode_import_available(root.path()));
+        assert!(Catalog::opencode_config_paths(root.path()).contains(&imported));
+        let denied = Catalog::load_with_opencode(root.path(), None, false)?;
+        assert!(denied.provider("consent-fixture").is_none());
+        let accepted = Catalog::load_with_opencode(root.path(), None, true)?;
+        assert_eq!(
+            accepted.provider("consent-fixture").unwrap().options["apiKey"],
+            "fixture-key"
+        );
+        let explicit = Catalog::load_with_opencode(root.path(), Some(&imported), false)?;
+        assert!(explicit.model("consent-fixture", "fixture-model").is_some());
+        std::fs::write(&imported, "not valid json")?;
+        assert!(Catalog::load_with_opencode(root.path(), None, false).is_ok());
+        assert!(Catalog::load_with_opencode(root.path(), Some(&imported), false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn openraid_provider_config_remains_available_without_import_consent() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join("openraid.json"),
+            r#"{"provider":{"native-fixture":{"npm":"@ai-sdk/openai-compatible","models":{"fixture-model":{}}}}}"#,
+        )?;
+        std::fs::write(root.path().join("opencode.json"), "invalid ignored config")?;
+        let catalog = Catalog::load_with_opencode(root.path(), None, false)?;
+        assert!(catalog.model("native-fixture", "fixture-model").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn imported_local_providers_merge_before_openraid_overrides() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join("opencode.json"),
+            r#"{"provider":{"import-only-fixture":{"models":{"fixture-model":{}}},"merge-fixture":{"options":{"baseURL":"https://import.invalid/v1","apiKey":"imported-key"},"models":{"fixture-model":{}}}}}"#,
+        )?;
+        std::fs::write(
+            root.path().join("openraid.json"),
+            r#"{"provider":{"merge-fixture":{"options":{"baseURL":"https://openraid.invalid/v1"}}}}"#,
+        )?;
+        let catalog = Catalog::load_with_opencode(root.path(), None, true)?;
+        assert!(catalog
+            .model("import-only-fixture", "fixture-model")
+            .is_some());
+        let provider = catalog.provider("merge-fixture").unwrap();
+        assert_eq!(provider.api, "https://openraid.invalid/v1");
+        assert_eq!(provider.options["apiKey"], "imported-key");
+        Ok(())
+    }
 
     #[test]
     fn copilot_loader_routes_family_and_explicit_endpoint_before_adapter_defaults() -> Result<()> {

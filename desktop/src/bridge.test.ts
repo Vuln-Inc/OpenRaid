@@ -45,6 +45,18 @@ describe("native bridge contract", () => {
     expect(invoke).toHaveBeenCalledWith("desktop_open", { request: { workspace: "C:\\my workspace", mock: false } });
   });
 
+  it("checks OpenCode availability separately from persisting import consent", async () => {
+    invoke.mockResolvedValue({ available: true, consent: null });
+    await native.opencodeStatus("C:\\my workspace");
+    await native.importOpencode("C:\\my workspace", false);
+    await native.importOpencode("C:\\my workspace", true);
+    expect(invoke.mock.calls).toEqual([
+      ["desktop_opencode_status", { workspace: "C:\\my workspace" }],
+      ["desktop_import_opencode", { workspace: "C:\\my workspace", enabled: false }],
+      ["desktop_import_opencode", { workspace: "C:\\my workspace", enabled: true }],
+    ]);
+  });
+
   it("forwards session controls without rewriting their fields", async () => {
     const request = { action: "model", provider: "openai", model: "example-model", variant: "high" };
     invoke.mockResolvedValue({ state: "IDLE" });

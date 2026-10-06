@@ -8,7 +8,7 @@ import { native, type Snapshot } from "./bridge";
 
 vi.mock("./bridge", async importOriginal => {
   const original = await importOriginal<typeof import("./bridge")>();
-  return { ...original, native: { snapshot: vi.fn(), subscribe: vi.fn(), errors: vi.fn().mockResolvedValue(() => {}), query: vi.fn(), control: vi.fn() } };
+  return { ...original, native: { snapshot: vi.fn(), subscribe: vi.fn(), errors: vi.fn().mockResolvedValue(() => {}), query: vi.fn(), control: vi.fn(), opencodeStatus: vi.fn().mockResolvedValue({ available: false, consent: null }) } };
 });
 const snapshot: Snapshot = {
   state: "IDLE", workspace: "D:\\workspace", database: "D:\\workspace\\session.sqlite3", session_id: "session-test",
@@ -105,6 +105,21 @@ it("shows a quiet, accessible session status that follows runtime events", async
     expect(status.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     expect(status).not.toHaveClass("rounded-full");
   }
+});
+
+it("resumes an idle reopened unfinished task without sending another prompt", async () => {
+  vi.mocked(native.snapshot).mockResolvedValue(snapshot);
+  render(<App />);
+  await screen.findByRole("status", { name: "Session state: IDLE" });
+  expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
+  await act(async () => { publish({ ...snapshot, resumable: true }); });
+  const resume = screen.getByRole("button", { name: "Resume saved task" });
+  expect(resume).toBeEnabled();
+  await userEvent.click(resume);
+  expect(native.control).toHaveBeenCalledExactlyOnceWith({ action: "resume" });
+  expect(screen.getByRole("textbox", { name: "Objective" })).toHaveValue("");
+  await act(async () => { publish({ ...snapshot, state: "RUNNING", resumable: true }); });
+  expect(screen.getByRole("button", { name: "Resume" })).toBeDisabled();
 });
 
 it("shows the active reasoning variant next to the model and updates from pushed snapshots", async () => {

@@ -9,4 +9,5 @@ verification. Keep change descriptions concise and link the associated issues.
 Link detailed documentation instead of repeating the full implementation record.
 
 Save notes as `docs/releases/vX.Y.Z.md`. Release automation uses that file and
-attaches the verified platform archives and checksums before publishing.
+attaches only the verified `openraid.exe`, `openraid-desktop.exe`, and `LICENSE`
+assets before publishing. Linux/macOS CI still verifies native source builds.

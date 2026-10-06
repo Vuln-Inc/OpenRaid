@@ -41,6 +41,9 @@ export function App() {
   const [transcript, setTranscript] = useState("");
   const [tail, setTail] = useState("");
   const [confirmation, setConfirmation] = useState<{ title: string; description: string; label: string; action: () => void } | null>(null);
+  const [importPrompt, setImportPrompt] = useState<{ workspace: string; startup: boolean; openMock?: boolean } | null>(null);
+  const [importRevision, setImportRevision] = useState(0);
+  const importCheck = useRef(0);
   const [palette, setPalette] = useState("dark");
   const [themeStyle, setThemeStyle] = useState<CSSProperties>({});
   useEffect(() => {
@@ -92,6 +95,16 @@ export function App() {
   }, [snapshot?.database]);
   useEffect(() => { if (connected) void loadTheme().catch(reason => notifyError(String(reason))); }, [connected]);
   useEffect(() => {
+    if (!connected) return;
+    let disposed = false;
+    const check = ++importCheck.current;
+    const currentWorkspace = snapshot?.workspace ?? workspace;
+    native.opencodeStatus(currentWorkspace).then(status => {
+      if (!disposed && check === importCheck.current && status.available && status.consent === null) setImportPrompt({ workspace: currentWorkspace, startup: true });
+    }).catch(reason => { if (!disposed && check === importCheck.current) notifyError(String(reason)); });
+    return () => { disposed = true; };
+  }, [connected, snapshot?.workspace]);
+  useEffect(() => {
     latestActivity.current = selected && snapshot ? { id: selected, database: snapshot.database } : null;
     setTail("");
     void fetchTail();
@@ -122,6 +135,36 @@ export function App() {
     setBusy(true); notifyError("");
     try { await work(); } catch (reason) { notifyError(String(reason)); }
     finally { setBusy(false); }
+  }
+  async function openWorkspace(path: string, demo: boolean) {
+    const before = revision.current;
+    const result = await native.open(path, demo);
+    if (before === revision.current) setSnapshot(result);
+  }
+  async function requestOpen() {
+    ++importCheck.current;
+    await task(async () => {
+      const status = await native.opencodeStatus(workspace);
+      if (status.available && status.consent === null) {
+        setImportPrompt({ workspace, startup: true, openMock: mock });
+        return;
+      }
+      await openWorkspace(workspace, mock);
+    });
+  }
+  async function decideImport(enabled: boolean) {
+    const prompt = importPrompt;
+    if (!prompt) return;
+    await task(async () => {
+      await native.importOpencode(prompt.workspace, enabled);
+      setImportRevision(value => value + 1);
+      if (enabled) notify("OpenCode credentials and provider settings are now available.");
+      if (prompt.openMock !== undefined) await openWorkspace(prompt.workspace, prompt.openMock);
+    });
+  }
+  function requestImport(path: string) {
+    ++importCheck.current;
+    setImportPrompt({ workspace: path, startup: false });
   }
   async function control(action: string, fields: Record<string, unknown> = {}) {
     const work = async () => {
@@ -164,10 +207,10 @@ export function App() {
     {snapshot?.runtime_error && <div className="error" role="alert"><span>{snapshot.runtime_error}</span></div>}
     {!snapshot ? <main className="welcome"><div className="welcome-brand"><img src={appIcon} alt="" /><span>OpenRaid</span></div><div className="welcome-card"><ShellIcon name="folder" className="welcome-icon" /><h2>Let’s build something</h2><p>Open a project to start working with your agents.</p>
       <span className="connection-status" role="status" aria-label="Session state: not connected">{connected ? "Ready to open a workspace" : "Connecting to desktop…"}</span>
-      <form onSubmit={event => { event.preventDefault(); void task(async () => { const before = revision.current; const result = await native.open(workspace, mock); if (before === revision.current) setSnapshot(result); }); }}>
+      <form onSubmit={event => { event.preventDefault(); void requestOpen(); }}>
         <Input label="Workspace folder" isRequired value={workspace} onChange={setWorkspace} placeholder="Choose a project folder path" />
         <Checkbox label="Use offline demo provider" isSelected={mock} onChange={setMock} hint="Demo mode runs without credentials. Your real provider preferences stay unchanged." />
-        <Button type="submit" className="primary" disabled={busy || !connected}>{busy ? "Opening workspace…" : connected ? "Open workspace" : "Connecting to desktop…"}</Button>
+        <Button type="submit" className="primary" disabled={busy || !connected || !!importPrompt}>{busy ? "Opening workspace…" : connected ? "Open workspace" : "Connecting to desktop…"}</Button>
       </form><p className="welcome-note">Shared with the terminal: saved sessions, preferences and credentials. Opening a workspace does not start agents.</p></div></main> : <>
       <main className="workspace-shell"><Tabs className="workspace grid" orientation="vertical" selectedKey={tab} onSelectionChange={key => setTab(String(key) as Tab)}>
         <aside className="roster" aria-label="Agents" id="workspace-sidebar">
@@ -193,7 +236,7 @@ export function App() {
           <div className="toolbar" aria-label="Session controls">
             <div className="run-actions">
               <Button className="icon-button ghost" aria-label="Pause" disabled={snapshot.state !== "RUNNING"} title="Pause running agents; resume them later" onClick={() => void control("pause")}><ShellIcon name="pause" /></Button>
-              <Button className="icon-button ghost" aria-label="Resume" disabled={snapshot.state !== "PAUSED"} title="Continue paused agents" onClick={() => void control("resume")}><ShellIcon name="play" /></Button>
+            <Button className="icon-button ghost" aria-label={idle && snapshot.resumable ? "Resume saved task" : "Resume"} disabled={snapshot.state !== "PAUSED" && !(idle && snapshot.resumable)} title={idle && snapshot.resumable ? "Resume saved task" : "Continue paused agents"} onClick={() => void control("resume")}><ShellIcon name="play" /></Button>
               <Button className="icon-button ghost" aria-label="Stop run" disabled={idle || stopping} title="Cancel current requests and tools; saved history remains" onClick={() => setConfirmation({ title: "Stop this run?", description: "Cancel current requests and tool operations. Saved history remains; completed file changes are not undone.", label: "Stop run", action: () => { void control("stop"); } })}><ShellIcon name="stop" /></Button>
             </div>
           </div>
@@ -208,13 +251,13 @@ export function App() {
           </div>}
            {tab === "Prompts" && <VirtualList items={snapshot.prompts} rowHeight={108} label="Prompt history" emptyState={<div className="empty-state"><h2>Your instructions, saved</h2><p>Objectives and follow-up prompts appear here. Reuse any prompt as a draft, or restore its saved workspace snapshot while idle.</p></div>} getKey={item => item.seq} render={item => <div className="prompt-row"><Button className="message" onClick={() => setExpanded(item)}><strong>Prompt #{item.seq}</strong><p>{item.body}</p></Button><Button onClick={() => { setDraft(item.body); notify("Prompt copied into your draft. Review it before sending."); objectiveInput.current?.focus(); }}>Use draft</Button><Button disabled={busy || !idle} title={idle ? "Restore this prompt and its saved workspace snapshot" : "Stop the run before restoring a workspace snapshot"} onClick={() => setConfirmation({ title: "Restore this prompt?", description: "This restores the prompt and its available Git workspace snapshot. Workspace files may change. Review or save your current work first.", label: "Restore snapshot", action: () => { void control("restore", { sequence: item.seq }); } })}>Restore</Button></div>} />}
           {tab === "Sessions" && <SessionNavigator snapshot={snapshot} busy={busy} onNew={confirmNew} onOpen={id => control("session", { id })} />}
-          {tab === "Settings" && <div className="settings"><ModelPicker provider={snapshot.provider} model={snapshot.model} variant={snapshot.variant ?? null} busy={busy} onSelect={(provider, model, variant) => control("model", { provider, model, variant })} /><ThemePicker busy={busy} onSelect={name => control("theme", { name })} /><SettingsPanel busy={busy} onControl={control} /></div>}
+          {tab === "Settings" && <div className="settings"><section className="settings-section"><div className="section-heading"><div><h2>OpenCode import</h2><p>Use existing OpenCode credentials and provider settings after confirmation.</p></div><Button disabled={busy} onClick={() => requestImport(snapshot.workspace)}>Import from OpenCode</Button></div></section><ModelPicker key={importRevision} provider={snapshot.provider} model={snapshot.model} variant={snapshot.variant ?? null} busy={busy} onSelect={(provider, model, variant) => control("model", { provider, model, variant })} /><ThemePicker busy={busy} onSelect={name => control("theme", { name })} /><SettingsPanel key={importRevision} busy={busy} onControl={control} /></div>}
           </TabPanel>
         <div className="composer-dock" hidden={tab === "Settings" || tab === "Sessions"}>
       <form className="composer" onSubmit={event => { event.preventDefault(); if (draft.trim()) void task(async () => { const text = draft; const before = revision.current; const result = await native.control({ action: "start", text }); if (isSnapshot(result) && before === revision.current) setSnapshot(result); setDraft(""); }); }}>
         <TextArea aria-label={idle ? "Objective" : "Follow-up instruction"} textAreaRef={objectiveInput} placeholder={idle ? "Ask your agents to do anything…" : "Send a follow-up instruction…"} value={draft} onChange={setDraft} isDisabled={stopping || busy} size="sm" rows={2} textAreaClassName="composer-input" onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); if (!busy && !stopping && draft.trim()) objectiveInput.current?.form?.requestSubmit(); } }} />
         <div className="composer-toolbar">
-          <ModelMenu snapshot={snapshot} busy={busy} onSelect={(provider, model, variant) => control("model", { provider, model, variant })} />
+          <ModelMenu key={importRevision} snapshot={snapshot} busy={busy} onSelect={(provider, model, variant) => control("model", { provider, model, variant })} />
           <Button type="submit" className="primary send-button" aria-label={idle ? "Start swarm" : "Send prompt"} title={idle ? "Start swarm" : "Send prompt"} disabled={busy || stopping || !draft.trim()}><ShellIcon name="arrow" /></Button>
         </div>
       </form>
@@ -224,6 +267,7 @@ export function App() {
       </Tabs></main>
     </>}
     {confirmation && <ConfirmDialog title={confirmation.title} description={confirmation.description} confirmLabel={confirmation.label} onConfirm={confirmation.action} onClose={() => setConfirmation(null)} />}
+    {importPrompt && <ConfirmDialog title="Use existing OpenCode settings?" description="OpenRaid can use the credentials, provider keys, and configurations found in OpenCode. Choose Import from OpenCode to enable access, or keep your OpenRaid setup separate. You can import later from Settings." confirmLabel="Import from OpenCode" cancelLabel={importPrompt.startup ? "Keep separate" : "Cancel"} confirmClassName="primary" onConfirm={() => { void decideImport(true); }} onCancel={importPrompt.startup ? () => { void decideImport(false); } : undefined} onClose={() => setImportPrompt(null)} />}
     {expanded && <MessageDialog message={expanded} onClose={() => setExpanded(null)} />}
   </div>;
 }
