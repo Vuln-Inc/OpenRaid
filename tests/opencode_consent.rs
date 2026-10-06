@@ -77,7 +77,10 @@ async fn open_and_close(
                 .execute("pty_write", &json!({"id":id,"data":data}))
                 .await?;
         }
-        let console = wait_for_text(workspace, id, "openraid by vuln.industries").await?;
+        // The consent picker also renders the application branding. Wait for
+        // the actual dashboard before sending exit keys; otherwise Unix can
+        // receive them while setup is still transitioning out of the picker.
+        let console = wait_for_text(workspace, id, "IDLE").await?;
         if consent.is_none() {
             ensure!(
                 !console.contains("Existing OpenCode information found"),
@@ -102,10 +105,15 @@ async fn open_and_close(
         Ok::<_, anyhow::Error>(())
     })
     .await;
+    let diagnostic = if result.is_err() {
+        Some(workspace.execute("pty_read", &json!({"id":id})).await?)
+    } else {
+        None
+    };
     workspace
         .execute("pty_kill", &json!({"id":id,"cleanup":true}))
         .await?;
-    result??;
+    result.with_context(|| format!("consent console timed out: {diagnostic:?}"))??;
     Ok(())
 }
 

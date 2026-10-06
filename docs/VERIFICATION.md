@@ -1,5 +1,21 @@
 # Verification record
 
+## v1.2.1 — Unix consent-fixture readiness
+
+The v1.2.1 Windows release job passed. Linux and both macOS jobs timed out in
+`tests/opencode_consent.rs`: the fixture mistook branding shared with the consent
+picker for a ready dashboard and could send exit keys before the transition.
+The fixture now waits for the dashboard's `IDLE` state. Timeout errors include
+the terminal output, and terminal cleanup remains explicit.
+
+The corrected regression passed on Windows and in **10 consecutive Linux/WSL
+runs**, with Rust 1.99.0 on Linux. Windows warnings-denied targeted Clippy,
+formatting, and whitespace checks also passed. The corrected-source Linux
+all-target suite passed **396 tests, 0 failed, 7 ignored**; the ignored tests are
+the optional Node/MCP/SDK fixtures. Final Windows consent, version-alignment, and
+all **9 packaging tests** passed. Native macOS and optional-fixture verification
+remain part of the replacement release workflow.
+
 ## v1.2.1 — Complete session reopening and explicit OpenCode import
 
 Coordinated Windows verification passed on **2026-10-07**, using Rust **1.96.0**:
