@@ -2,6 +2,14 @@
 
 ## v1.2.1 — Unix consent-fixture readiness
 
+The next Apple Silicon run passed the consent fixture, then exposed a separate
+PID-file readiness race in `tests/stop_immediate.rs`: a newly created file was
+read before its PID was written. Parent/descendant fixtures now write to pending
+files and atomically rename them into place. All seven immediate-stop tests
+passed on Windows and in **17 consecutive Linux/WSL runs** before the repetition
+command was interrupted. Windows targeted warnings-denied Clippy and formatting
+passed. Version remains **1.2.1**; native macOS verification is delegated to CI.
+
 The v1.2.1 Windows release job passed. Linux and both macOS jobs timed out in
 `tests/opencode_consent.rs`: the fixture mistook branding shared with the consent
 picker for a ready dashboard and could send exit keys before the transition.

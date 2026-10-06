@@ -9,6 +9,15 @@ use tokio::{
 
 // The test executable supplies real parent/descendant processes independently
 // of external programs, network access, and platform shell syntax.
+fn publish_process_id(path: &str) -> Result<()> {
+    // Readers use existence as readiness. Publish only after the complete PID
+    // is written, rather than exposing the empty file created by fs::write.
+    let pending = format!("{path}.pending");
+    std::fs::write(&pending, std::process::id().to_string())?;
+    std::fs::rename(pending, path)?;
+    Ok(())
+}
+
 #[test]
 fn command_parent_fixture() {
     if !Path::new("fixture.enabled").exists() {
@@ -19,7 +28,7 @@ fn command_parent_fixture() {
         .stdin(Stdio::null())
         .spawn()
         .unwrap();
-    std::fs::write("parent.pid", std::process::id().to_string()).unwrap();
+    publish_process_id("parent.pid").unwrap();
     println!("PARENT_RUNNING");
     let _ = child.wait();
 }
@@ -29,7 +38,7 @@ fn command_descendant_fixture() {
     if !Path::new("fixture.enabled").exists() {
         return;
     }
-    std::fs::write("descendant.pid", std::process::id().to_string()).unwrap();
+    publish_process_id("descendant.pid").unwrap();
     loop {
         println!("DESCENDANT_RUNNING");
         std::thread::sleep(Duration::from_millis(50));
